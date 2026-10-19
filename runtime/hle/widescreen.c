@@ -156,17 +156,9 @@ static bool heap_ptr(uint64_t p) { return p >= HEAP_BASE && p + 0x40 <= HEAP_BAS
 
 // Current camera zone's box; false when there is none (title, overworld, loading).
 static bool current_zone(float lo[3], float hi[3], uint32_t *id) {
-    uint64_t o = LD64(SDK_BASE + 0xcf9e38);
-    if (!heap_ptr(o)) return false;
-    uint64_t z = LD64(o + 0x680);
-    if (!heap_ptr(z)) return false;
-    const float *f = (const float *)(uintptr_t)(z + 0x10);
-    for (int i = 0; i < 3; i++) {
-        lo[i] = f[i], hi[i] = f[4 + i];
-        if (!(hi[i] > lo[i]) || hi[i] - lo[i] > 2000) return false;
-    }
-    *id = *(const uint32_t *)(uintptr_t)z;
-    return true;
+    (void)lo; (void)hi; (void)id;
+    (void)heap_ptr;
+    return false;
 }
 
 // Horizontal crop (uv of the wide image): ROOM_CROP for a room wider than one screen (u0..u1), ROOM_BOX for a
@@ -263,7 +255,5 @@ void widescreen_present_crop(uint64_t frame, double shape, float crop[4], double
 
 // Current level name for logs ("-" when not in play).
 const char *game_level_name(void) {
-    extern int game_in_play(void);
-    uint64_t ps = LD64(MAIN_BASE + 0x1CC1368);
-    return game_in_play() && ps && *(const char *)(uintptr_t)ps ? (const char *)(uintptr_t)ps : "-";
+    return "-";
 }

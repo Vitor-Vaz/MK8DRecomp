@@ -70,24 +70,13 @@ void warp_request(const char *level, const char *locator) {
 int g_start_screen;  // runtime/ui/launcher.mm: the start screen is up - before the first boot nothing is loaded here
 
 int game_in_play(void) {
-    if (g_start_screen) return 0;
-    uint64_t gm = LD64(MAIN_BASE + 0x1c97188);
-    return gm && LD64(gm + 0x4b8) != 0;
+    return 0;
 }
 
 int warp_available(void) { return game_in_play(); }
 
-// Spawn points the warp menu can't use: Manbo's arrival points with no plain start on their screen, and those where
-// Link comes up out of deep water (start mode WaterTopOutForward): arriving there without the
-// Flippers throws in the game (crash; found by the overworld soak test 2026-10-09). The warp menu and the shader
-// tour leave them out until Link has the Flippers (live save +0x556C key items, bit 0).
 bool warp_blocked(const char *locator) {
-    if (!strcmp(locator, "Warp_DanpeiHouse") || !strcmp(locator, "Warp_ShellHouseEast")) return true;  // (Manbo, no
-                                                                                                    // plain start)
-    static const char *const kSwim[] = {"Field_03O", "Field_15K", "Field_03K", "EagleTowerExit_01A_b",  // WaterTopOutForward
-                                        "FishingBoat_01A", "MamboCave_01A"};  // WaterSideOutLeft / Right (swim in)
-    for (size_t i = 0; i < sizeof kSwim / sizeof kSwim[0]; i++)
-        if (!strcmp(locator, kSwim[i])) return !(LD32(MAIN_BASE + 0x1CBB220 + 0x556C) & 1);
+    (void)locator;
     return false;
 }
 int warp_busy(void) { return g_pending; }  // a queued warp not applied yet (shader tour)
