@@ -82,7 +82,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 }
 #endif
 
-static const uint8_t BUILD_ID[8] = {0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0xcb};  // Link's Awakening v1.0.0 main
+static const uint8_t BUILD_ID[8] = {0x24, 0x52, 0xc4, 0x9b, 0xc2, 0x6e, 0xc1, 0x59};  // Mario Kart 8 Deluxe v3.0.4 main
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): beta_<n> until 1.0, then v<major>.<minor>.<patch>.
 #define LARECOMP_VERSION "beta_4"
@@ -91,8 +91,8 @@ static const uint8_t BUILD_ID[8] = {0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0x
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
 // Windows 10+ ship) and offers the best one if it outranks this build: any v1.0.0+ above every beta, betas by
 // number; other tags (the alpha_* ones) are ignored. Offline / no curl / anything unexpected: nothing is shown.
-#define RELEASES_URL "https://api.github.com/repos/peiikai/LASRecomp/releases?per_page=100"
-#define RELEASE_PAGE "https://github.com/peiikai/LASRecomp/releases/tag/"
+#define RELEASES_URL "https://api.github.com/repos/Vitor-Vaz/MK8DRecomp/releases?per_page=100"
+#define RELEASE_PAGE "https://github.com/Vitor-Vaz/MK8DRecomp/releases/tag/"
 
 static long long tag_rank(const std::string &t) {
     int n, a, b, c;
@@ -176,8 +176,8 @@ static std::string check_copied_files(const std::string &root) {
     fseek(f, 0x40, SEEK_SET);
     size_t n = fread(id, 1, 8, f);
     fclose(f);
-    if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v1.0.0)";
-    if (!file_exists(root + "/romfs/region_common") || !file_exists(root + "/romfs.bin")) return "Game data missing";
+    if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v3.0.4)";
+    if (!file_exists(root + "/romfs.bin")) return "Game data missing";
     return "";
 }
 
@@ -218,7 +218,7 @@ static void set_failure(int k) {
         "Choose the folder that holds the game files.",
         "Choose the folder that holds the game files.",
         "Make sure there's about 12 GB free and try again.",
-        "LAS Recomp needs version 1.0.0 of the game, without updates.",
+        "MK8DRecomp needs version 3.0.4 of the game.",
         "Some files are missing. Choose the folder again; if it happens again, copy your extracted game files again.",
         "Make sure there's about 2 GB free and try again. If it keeps happening, report it on GitHub."};
     if (k >= 1 && k <= 6) set_job(head[k], true, hint[k]);
@@ -229,12 +229,12 @@ static bool is_dir(const std::string &p) {
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-// exefs: the folder with main and main.npdm; romfs: the folder with region_common (the game's data root). Found
+// exefs: the folder with main and main.npdm; romfs: the folder with Course (the game's data root). Found
 // in the picked folder or a few levels below it (some folder layouts nest them).
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &unusable) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
     if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
-    if (romfs.empty() && is_dir(dir + "/region_common")) romfs = dir;
+    if (romfs.empty() && is_dir(dir + "/Course")) romfs = dir;
     DIR *d = opendir(dir.c_str());
     if (!d) return;
     std::vector<std::string> sub;
@@ -244,7 +244,7 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
         std::string ext = n.size() > 4 ? n.substr(n.size() - 4) : "";
         for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
         if (ext == ".xci" || ext == ".nsp" || ext == ".nca" || ext == ".nsz" || ext == ".xcz") unusable = true;
-        if (n != "region_common" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
+        if (n != "Course" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
     }
     closedir(d);
     std::sort(sub.begin(), sub.end());

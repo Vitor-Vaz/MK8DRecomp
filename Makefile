@@ -68,16 +68,19 @@ GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup  # (the runtime functio
 GAMELIB_SHARED := -shared -Wl,-undefined,dynamic_lookup  # (the same, for the start screen's build: zig cc)
 else ifeq ($(PLATFORM),linux)
 EXE      := $(B)/lasrecomp
+ifeq ($(DEPS),)
+DEPS     := $(if $(wildcard /home/linuxbrew/.linuxbrew/include/SDL3/SDL.h),/home/linuxbrew/.linuxbrew)
+endif
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
 endif
 GENFLAGS += $(GENARCH) -fPIC
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
-SHADERC  ?= -lshaderc  # (Debian / Ubuntu's libshaderc.so; a shaderc built from source: -lshaderc_shared)
+SHADERC  ?= $(if $(wildcard $(DEPS)/lib/libshaderc_shared.so),-lshaderc_shared,-lshaderc)
 LLD_FLAG := $(if $(wildcard /home/linuxbrew/.linuxbrew/bin/ld.lld),-B/home/linuxbrew/.linuxbrew/bin) -fuse-ld=lld
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
-LDFLAGS  := $(LLD_FLAG) -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
+LDFLAGS  := $(LLD_FLAG) -rdynamic $(if $(DEPS),-L$(DEPS)/lib -Wl$(comma)-rpath$(comma)$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan $(SHADERC) -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
