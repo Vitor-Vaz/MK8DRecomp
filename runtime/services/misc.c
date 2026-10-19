@@ -41,8 +41,28 @@ SERVICE("aoc:u", aoc_u) {
     switch (req->cmd) {
     case 2: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;   // CountAddOnContent
     case 3: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;   // ListAddOnContent
-    case 5: OUT(uint64_t, 0) = 0x01006BB00C6F1000ull; resp_size(resp, 8); break;  // GetAddOnContentBaseId
+    case 5: OUT(uint64_t, 0) = 0x0100152000023000ull; resp_size(resp, 8); break;  // GetAddOnContentBaseId (MK8D)
     case 8: resp->copy_handles[resp->ncopy++] = new_event_handle(); break;
     default: ok_logger(s, req, resp);
     }
 }
+
+// ------------------------------------------------------------------ mii:e / mii:u
+static void mii_db_service(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    switch (req->cmd) {
+    case 0: case 1: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // IsUpdated, IsFullDatabase
+    case 2: case 3: case 4: case 5: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetCount, Get, Get1, UpdateLatest
+    default: LOG("[mii] IDatabaseService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x58); break;
+    }
+}
+
+static void mii_root(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    if (req->cmd == 0)
+        ipc_return_object(resp, service_new("IDatabaseService", mii_db_service, NULL));
+    else
+        ok_logger(s, req, resp);
+}
+SERVICE("mii:e", mii_e) { mii_root(s, req, resp); }
+SERVICE("mii:u", mii_u) { mii_root(s, req, resp); }
