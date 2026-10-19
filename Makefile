@@ -33,8 +33,9 @@ B         ?= build
 MACOS_MIN ?=
 DEPS      ?=
 MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
-CC       := clang $(MINFLAG) $(CROSS)
-CXX      := clang++ $(MINFLAG) $(CROSS)
+CLANG_PREFIX := $(if $(shell command -v clang 2>/dev/null),,$(if $(wildcard /home/linuxbrew/.linuxbrew/opt/llvm/bin/clang),/home/linuxbrew/.linuxbrew/opt/llvm/bin/))
+CC       := $(CLANG_PREFIX)clang $(MINFLAG) $(CROSS)
+CXX      := $(CLANG_PREFIX)clang++ $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
@@ -74,15 +75,16 @@ endif
 GENFLAGS += $(GENARCH) -fPIC
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
 SHADERC  ?= -lshaderc  # (Debian / Ubuntu's libshaderc.so; a shaderc built from source: -lshaderc_shared)
+LLD_FLAG := $(if $(wildcard /home/linuxbrew/.linuxbrew/bin/ld.lld),-B/home/linuxbrew/.linuxbrew/bin) -fuse-ld=lld
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
-LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
+LDFLAGS  := $(LLD_FLAG) -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan $(SHADERC) -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
 GAMELIB  := $(B)/lasgame.so
-GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the app's own, -rdynamic)
+GAMELIB_LDFLAGS := -shared $(LLD_FLAG)  # (the runtime functions it calls: the app's own, -rdynamic)
 GAMELIB_SHARED := -shared
 else
 EXE      := $(B)/lasrecomp.exe
@@ -257,61 +259,43 @@ dist:
 	    else /c/Windows/System32/tar.exe -a -cf "LAS Recomp-$(VERSION)-windows.zip" "LAS Recomp"; fi
 	@echo "build/dist/LAS Recomp-$(VERSION)-windows.zip"
 
-# Seed generator as a standalone helper, so players need no Python: build/helper/rando-gen/ (rando-gen[.exe] +
-# _internal/), frozen by PyInstaller from tools/rando/rando_gen.spec in its own venv (build/rando-venv). Ship the
-# rando-gen folder next to the exe (Windows) or as "LAS Recomp.app"/Contents/Resources/rando-gen (runtime/ui/rando_tab.mm
-# generator_cmd). PyInstaller only builds for the OS it runs on.
-# macOS arm64: the relocatable Python 3.12 and keystone from `make deps` (macOS 11+ / 15+: the helper runs where the
-#   app does); without them Homebrew's python@3.12 and keystone (then only on the macOS they were built for). The
-#   keystone wheel has no dylib: KEYSTONE_LIB tells rando_gen.spec which one to take.
-# Windows x86-64 (untested): from the MSYS2 shell with a python.org CPython 3.12 (MSYS2's Python has no oead wheel),
-#   e.g. make rando-helper RANDO_PY="/c/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe"
 ifeq ($(PLATFORM),macos)
-RANDO_PY  ?= $(firstword $(wildcard build/deps/python/bin/python3.12) python3.12)
-export KEYSTONE_LIB ?= $(wildcard $(CURDIR)/build/deps/lib/libkeystone.dylib)
-RANDO_VPY := build/rando-venv/bin/python
+GEN_PY  ?= $(firstword $(wildcard build/deps/python/bin/python3.12) python3.12)
+GEN_VPY := build/gen-venv/bin/python
+else ifeq ($(PLATFORM),linux)
+GEN_PY  ?= python3
+GEN_VPY := build/gen-venv/bin/python
 else
-RANDO_PY  ?= py -3.12
-RANDO_VPY := build/rando-venv/Scripts/python.exe
+GEN_PY  ?= py -3.12
+GEN_VPY := build/gen-venv/Scripts/python.exe
 endif
 
-rando-helper: build/rando-venv/.ok
-	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
-	$(RANDO_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
-	    tools/rando/rando_gen.spec
-	@du -sh build/helper/rando-gen
-
-# The game code generator, the same way (tools/lasgen.spec): build/helper/lasgen/, shipped as lasgen/ next to the exe or
+# The game code generator (tools/lasgen.spec): build/helper/lasgen/, shipped as lasgen/ next to the exe or
 # in Contents/Resources. The start screen's setup runs it on the player's own game files (runtime/gamebuild.c).
-gen-helper: build/rando-venv/.ok build/rando-venv/.gen-ok
+gen-helper: build/gen-venv/.gen-ok
 	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
-	$(RANDO_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
+	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
 	    tools/lasgen.spec
-	$(if $(filter windows,$(PLATFORM)),$(RANDO_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
+	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
 	@du -sh build/helper/lasgen
 
-build/rando-venv/.gen-ok: build/rando-venv/.ok
-	$(RANDO_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5
-	touch $@
-
-build/rando-venv/.ok: third_party/LAS-Randomizer/requirements.txt
-	$(RANDO_PY) -m venv build/rando-venv
-	$(RANDO_VPY) -m pip install -q -r third_party/LAS-Randomizer/requirements.txt pyinstaller==6.22.3
+build/gen-venv/.gen-ok:
+	$(GEN_PY) -m venv build/gen-venv
+	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
 	touch $@
 
 # Linux: build/dist/LAS Recomp-<version>-linux-<arch>.AppImage, built in Ubuntu 22.04 containers (podman) with SDL3, LGPL
-# FFmpeg, shaderc and the seed generator helper inside; the Vulkan loader and GPU drivers are the system's.
+# FFmpeg, shaderc; the Vulkan loader and GPU drivers are the system's.
 # `make appimage` (ARCH: this machine's, or aarch64 cross-compiled), `make appimages` both. See docs/linux.md.
 appimage:
 	tools/linux/appimage.sh $(ARCH)
 appimages:
 	tools/linux/appimage.sh x86_64
 	tools/linux/appimage.sh aarch64
-# release check of the x86-64 AppImage: start screen, into the game, warps to the overworld and every dungeon
 smoketest:
 	tools/linux/smoketest.sh
 
-.PHONY: dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest
+.PHONY: dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist appimage appimages smoketest
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c
