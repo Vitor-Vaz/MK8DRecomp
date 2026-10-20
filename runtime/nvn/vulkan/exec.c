@@ -1700,7 +1700,9 @@ static void alias_drop(int i) {
 
 // the real copy of the aspects asked for, into the destination's own image
 static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why) {
+    if (!a || !a->src || !a->dst) return;
     TexBackend *s = a->src->backend, *d = a->dst->backend;
+    if (!s || !s->image || !d || !d->image) return;
     aspects &= d->aspect;
     if (!aspects) return;
     vk_end_pass();
@@ -1831,6 +1833,7 @@ static void resolve_feedback(Prog *pr) {
             for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
             bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
             TexBackend *src = vk_tex(t, true);
+            if (!src || !src->image) continue;
             Snap *existing = NULL;
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
             VkImageAspectFlags sa = src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : src->aspect;
@@ -1844,6 +1847,7 @@ static void resolve_feedback(Prog *pr) {
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
+            if (!dst || !dst->image) continue;
             VkCommandBuffer cb = vk_cmd();
             vk_full_barrier(cb);
             gp_mark(cb, "feedback snapshot %ux%u fmt %d", src->width, src->height, src->format);
@@ -2329,9 +2333,9 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         NvnTexture *tex = e->tex;
-        if (tex && tex->backend) {
+        if (tex) {
             NvnTexture *src_tex = naliases ? alias_read(tex) : tex;
-            if (src_tex && src_tex->backend) {
+            if (src_tex) {
                 // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
                 // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
                 // destroyed (eviction, image re-created) bumps vk_view_gen. LARECOMP_VK_NO_TEX_MEMO=1 disables.
@@ -3180,6 +3184,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     dl_note("copy texture %ux%u f%#x -> %ux%u f%#x (%p -> %p)", st_->width, st_->height, st_->format, dt->width, dt->height,
             dt->format, (void *)st_, (void *)dt);
     TexBackend *s = vk_tex(st_, false), *d = vk_tex(dt, true);
+    if (!s || !s->image || !d || !d->image) return;
     renderer_mark_gpu_owned(dt);
     if (renderer_texture_presented(dt) && st_->width == dt->width && st_->height == dt->height) renderer_texture_mark_presented(st_);
     renderer_texture_first_write(dt);

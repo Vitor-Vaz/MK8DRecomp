@@ -218,39 +218,12 @@ static int room_crop(uint64_t frame, double shape, float *u0, float *u1) {
     return r;
 }
 
-// Presented part of the image (crop: uv origin and size) and its place in the window: interiors and dungeons show
-// their 16:9 centre (taller outputs: the 16:9 band), rooms wider than one screen the part inside the room.
+// Presented part of the image (crop: uv origin and size) and its place in the window.
+// MK8D renders natively in 16:9 / arbitrary aspect ratio without room-cropping.
 void widescreen_present_crop(uint64_t frame, double shape, float crop[4], double *vx, double *vy, double *vw, double *vh) {
-    static uint64_t last;  // (last wide boxed frame: room changes slide the edges instead of jumping)
-    static float cu0, cu1;
-    crop[0] = crop[1] = 0, crop[2] = crop[3] = 1;
+    (void)frame; (void)shape; (void)vx; (void)vy; (void)vw; (void)vh;
+    crop[0] = 0.0f; crop[1] = 0.0f; crop[2] = 1.0f; crop[3] = 1.0f;
     g_room_wide = false;
-    if (shape == 1.0 || !widescreen_frame_boxed(frame)) return;
-    if (shape < 1.0) {
-        crop[1] = (float)((1.0 - shape) / 2); crop[3] = (float)shape;
-        double nh = *vh * shape; *vy += (*vh - nh) / 2; *vh = nh;
-        return;
-    }
-    static int mode = ROOM_BOX;
-    float u0 = 0, u1 = 1;
-    static float k0, k1;  // (ROOM_KEEP: the last target)
-    extern int game_in_play(void);
-    int m = game_in_play() ? room_crop(frame, shape, &u0, &u1) : ROOM_BOX;
-    if (m == ROOM_KEEP) m = mode, u0 = k0, u1 = k1;
-    if (m == ROOM_BOX) u0 = (float)((1.0 - 1.0 / shape) / 2), u1 = 1.0f - u0;
-    if (m == ROOM_FULL) u0 = 0, u1 = 1;
-    mode = m, k0 = u0, k1 = u1;
-    g_room_wide = m != ROOM_BOX;
-    if (frame <= last + 2 && frame > last) {
-        const float step = 0.03f;  // of the image width per frame
-        cu0 += fmaxf(-step, fminf(step, u0 - cu0));
-        cu1 += fmaxf(-step, fminf(step, u1 - cu1));
-    } else {
-        cu0 = u0, cu1 = u1;
-    }
-    last = frame;
-    crop[0] = cu0, crop[2] = cu1 - cu0;
-    *vx += *vw * cu0, *vw *= cu1 - cu0;
 }
 
 // Current level name for logs ("-" when not in play).
