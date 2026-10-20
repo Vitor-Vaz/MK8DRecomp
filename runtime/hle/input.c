@@ -42,9 +42,69 @@ static void recompute_keyboard(void) {
     uint64_t b = 0;
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (held_key(g_bind_key[i])) b |= 1ull << i;
+
+    // Mario Kart 8 Deluxe PC key aliases:
+    // A (Accelerate / Confirm): Space, Enter, Keypad Enter, C, or K
+    if (held_key(SDL_SCANCODE_SPACE) || held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER) ||
+        held_key(SDL_SCANCODE_C) || held_key(SDL_SCANCODE_K)) {
+        b |= (1ull << BTN_A);
+        // On title / controller registration screen, pressing Space or Enter also satisfies "Press L + R"
+        if (held_key(SDL_SCANCODE_SPACE) || held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER)) {
+            b |= (1ull << BTN_L) | (1ull << BTN_R);
+        }
+    }
+    // B (Brake / Reverse / Cancel): X, Z, Backspace, Escape, or J
+    if (held_key(SDL_SCANCODE_X) || held_key(SDL_SCANCODE_Z) || held_key(SDL_SCANCODE_BACKSPACE) ||
+        held_key(SDL_SCANCODE_ESCAPE) || held_key(SDL_SCANCODE_J)) {
+        b |= (1ull << BTN_B);
+    }
+    // Drift / Hop (R & ZR): Left Shift, Right Shift, E, or 3
+    if (held_key(SDL_SCANCODE_LSHIFT) || held_key(SDL_SCANCODE_RSHIFT) || held_key(SDL_SCANCODE_E) || held_key(SDL_SCANCODE_3)) {
+        b |= (1ull << BTN_R) | (1ull << BTN_ZR);
+    }
+    // Item (L & ZL): Left Ctrl, Right Ctrl, Q, or 1
+    if (held_key(SDL_SCANCODE_LCTRL) || held_key(SDL_SCANCODE_RCTRL) || held_key(SDL_SCANCODE_Q) || held_key(SDL_SCANCODE_1)) {
+        b |= (1ull << BTN_L) | (1ull << BTN_ZL);
+    }
+    // Plus (Pause / Menu): Enter, P, or Escape
+    if (held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER) || held_key(SDL_SCANCODE_P)) {
+        b |= (1ull << BTN_PLUS);
+    }
+    // Minus (Map): Tab, M
+    if (held_key(SDL_SCANCODE_TAB) || held_key(SDL_SCANCODE_M)) {
+        b |= (1ull << BTN_MINUS);
+    }
+    // X (Look behind): V, L
+    if (held_key(SDL_SCANCODE_V) || held_key(SDL_SCANCODE_L)) {
+        b |= (1ull << BTN_X);
+    }
+    // Y (Horn): B, I
+    if (held_key(SDL_SCANCODE_B) || held_key(SDL_SCANCODE_I)) {
+        b |= (1ull << BTN_Y);
+    }
+
+    // D-Pad and Left Stick: Both Arrow Keys and WASD work seamlessly
+    int32_t lx = 0, ly = 0;
+    if (held_key(g_bind_key[BIND_LS_RIGHT]) || held_key(SDL_SCANCODE_RIGHT) || held_key(SDL_SCANCODE_D)) {
+        b |= (1ull << BTN_RIGHT);
+        lx += 32767;
+    }
+    if (held_key(g_bind_key[BIND_LS_LEFT]) || held_key(SDL_SCANCODE_LEFT) || held_key(SDL_SCANCODE_A)) {
+        b |= (1ull << BTN_LEFT);
+        lx -= 32767;
+    }
+    if (held_key(g_bind_key[BIND_LS_UP]) || held_key(SDL_SCANCODE_UP) || held_key(SDL_SCANCODE_W)) {
+        b |= (1ull << BTN_UP);
+        ly += 32767;
+    }
+    if (held_key(g_bind_key[BIND_LS_DOWN]) || held_key(SDL_SCANCODE_DOWN) || held_key(SDL_SCANCODE_S)) {
+        b |= (1ull << BTN_DOWN);
+        ly -= 32767;
+    }
+
     key_buttons = b;
-    key_lx = (held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) * 32767;
-    key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * 32767;
+    key_lx = lx;
+    key_ly = ly;
     key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
     key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
 }
@@ -402,14 +462,31 @@ static void fill_state(Cpu *c) {
     if (ry < -16000) b |= 1ull << 23;
     *(uint64_t *)(s + 8) = b;
     static uint64_t last_b;
-    if (b != last_b && getenv("LARECOMP_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
+    if (b != last_b) {
+        LOG("[input] buttons: %#llx (A=%d B=%d X=%d Y=%d L=%d R=%d ZL=%d ZR=%d +=%d -=%d)\n",
+            (unsigned long long)b,
+            (int)(b & 1), (int)((b >> 1) & 1), (int)((b >> 2) & 1), (int)((b >> 3) & 1),
+            (int)((b >> 6) & 1), (int)((b >> 7) & 1), (int)((b >> 8) & 1), (int)((b >> 9) & 1),
+            (int)((b >> 10) & 1), (int)((b >> 11) & 1));
+    }
     last_b = b;
     *(int32_t *)(s + 16) = lx;
     *(int32_t *)(s + 20) = ly;
     { extern void input_note_rstick(int32_t ry); input_note_rstick(ry); }
     *(int32_t *)(s + 24) = rx;
     *(int32_t *)(s + 28) = ry;
-    *(uint32_t *)(s + 32) = 1;  // IsConnected
+    *(uint32_t *)(s + 32) = 0xF;  // IsConnected | IsWired | IsLeftConnected | IsRightConnected
+}
+
+static void fill_states(Cpu *c) {
+    uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
+    int count = (int)c->x[1];
+    if (count <= 0) { c->x[0] = 0; return; }
+    Cpu tmp = *c;
+    tmp.x[0] = (uint64_t)(uintptr_t)s;
+    tmp.x[1] = (uint64_t)(uintptr_t)c->x[2];
+    fill_state(&tmp);
+    c->x[0] = 1;
 }
 
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }
@@ -417,6 +494,12 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual)
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
+
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", hid_states_fullkey) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", hid_states_dual) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", hid_states_left) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", hid_states_handheld) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", hid_states_right) { fill_states(c); }
 
 // FullKey / JoyDual / Handheld for Player 1 and Handheld
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
