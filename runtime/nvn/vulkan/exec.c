@@ -1836,7 +1836,7 @@ static void alias_draw_check(void) {
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_NO_FEEDBACK") != NULL;
+    if (off < 0) off = getenv("LARECOMP_FEEDBACK") == NULL;
     if (off) return;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
