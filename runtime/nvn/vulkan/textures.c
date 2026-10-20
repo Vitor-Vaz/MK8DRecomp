@@ -419,14 +419,15 @@ static TexBackend *tex_backend(NvnTexture *t) {
 }
 
 void backend_texture_destroyed(NvnTexture *t) {
+    if (!t) return;
     TexBackend *b = t->backend;
     if (b) {
-        extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
+        extern void vk_alias_texture_destroyed(NvnTexture *t);
         vk_alias_texture_destroyed(t);
         live_remove(b);
         destroy_image(b);
-        free(b->pending_rgba);
-        free(b);
+        if (b->pending_rgba) vk_defer_free(b->pending_rgba);
+        vk_defer_free(b);
     }
     t->backend = NULL;
 }
@@ -485,8 +486,9 @@ static void upload_pending(TexBackend *b) {
     VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = stride / 4,
                             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     VkCommandBuffer cb = vk_upload_cmd();
+    if (!cb || !s.buf || !b->image || rg.imageExtent.width == 0 || rg.imageExtent.height == 0) return;
     vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
@@ -498,6 +500,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint64_t frame = vk_frame_counter();
     if (b->uploaded && b->checked_frame == frame) return;
     if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+    VkImage img = b->image;
+    if (!img) return;
     VkFmt mf = fmt_of(t->format);
     uint64_t total = tegra_total_size(&t->layout);
     if (t->pool && t->pool->size && t->pool_offset + total > t->pool->size) {
@@ -569,8 +573,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
-                vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                if (!cb || !s.buf || !img || rg.imageExtent.width == 0 || rg.imageExtent.height == 0) continue;
+                vk_dl_note_upload((void *)img, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
+                vkCmdCopyBufferToImage(cb, s.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
                 continue;
             }
             uint32_t row = l.wb * fi->bpb;
@@ -599,10 +604,6 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 free(lin);
             }
             uint32_t w = l.w, hh = l.h, d = l.d;
-            // the copy stays inside the image's level: a texture allocated at the internal resolution (16:9, render
-            // target sized) can still be filled from the CPU - the save slots' screenshots on the title screen. Its
-            // full-size data overran the scaled image (only the width was clamped): GPU writes past the allocation,
-            // a device loss below 1x after a seed switch.
             if (w > level_w(b, lv)) w = level_w(b, lv);
             if (hh > level_h(b, lv)) hh = level_h(b, lv);
             VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.wb * fi->bw, .bufferImageHeight = l.hb * fi->bh,
@@ -611,8 +612,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                                     .imageExtent = {w, b->base_type == VK_IMAGE_VIEW_TYPE_1D || b->base_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? 1 : hh,
                                                     b->depth > 1 ? d : 1}};
             if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) continue;  // packed D/S: no CPU layout
-            vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+            if (!cb || !s.buf || !img || rg.imageExtent.width == 0 || rg.imageExtent.height == 0 || rg.imageExtent.depth == 0) continue;
+            vk_dl_note_upload((void *)img, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
+            vkCmdCopyBufferToImage(cb, s.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         }
     }
 }
