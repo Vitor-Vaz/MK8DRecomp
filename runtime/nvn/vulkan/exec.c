@@ -1593,10 +1593,13 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src) {
         d->mem = VK_NULL_HANDLE;
     }
     if (!d->image) {
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        else usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = src->format,
                                 .extent = {src->width, src->height, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = (VkSampleCountFlagBits)src->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                                .usage = usage};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
         d->format = src->format; d->width = src->width; d->height = src->height; d->depth = 1; d->layers = 1; d->levels = 1;
@@ -1710,8 +1713,24 @@ static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     gp_mark(cb, "copy texture (deferred, %s%s) %ux%u", why, aspects == d->aspect ? "" : ", stencil only", a->dst->width, a->dst->height);
-    VkImageCopy c = {.srcSubresource = {aspects, 0, 0, 1}, .dstSubresource = {aspects, 0, 0, 1}, .extent = {d->width, d->height, 1}};
-    vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    VkImageCopy copies[2];
+    uint32_t ncopies = 0;
+    if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+        copies[ncopies++] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+                                          .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+                                          .extent = {d->width, d->height, 1}};
+    }
+    if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+        copies[ncopies++] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                                          .dstSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                                          .extent = {d->width, d->height, 1}};
+    }
+    if (!ncopies) {
+        copies[ncopies++] = (VkImageCopy){.srcSubresource = {aspects, 0, 0, 1},
+                                          .dstSubresource = {aspects, 0, 0, 1},
+                                          .extent = {d->width, d->height, 1}};
+    }
+    vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, ncopies, copies);
     if (aspects == d->aspect) stat_alias_copied++; else stat_alias_partial++;
     if (ct_on()) LOG("[ct] alias copy %p -> %p aspects %#x (%s)\n", (void *)a->src, (void *)a->dst, aspects, why);
 }
@@ -1851,7 +1870,7 @@ static void resolve_feedback(Prog *pr) {
             VkCommandBuffer cb = vk_cmd();
             vk_full_barrier(cb);
             gp_mark(cb, "feedback snapshot %ux%u fmt %d", src->width, src->height, src->format);
-            VkImageCopy rg = {.srcSubresource = {src->aspect, 0, 0, 1}, .dstSubresource = {src->aspect, 0, 0, 1},
+            VkImageCopy rg = {.srcSubresource = {sa, 0, 0, 1}, .dstSubresource = {sa, 0, 0, 1},
                               .extent = {src->width, src->height, 1}};
             vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
             if (g_debug_frame && (src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
@@ -3240,9 +3259,24 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     }
     if (s->samples != d->samples) return;
     if (sw == dw && sh == dh && s->format == d->format) {
-        VkImageCopy c = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
-                         .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
-        vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        VkImageCopy copies[2];
+        uint32_t ncopies = 0;
+        if ((sa & VK_IMAGE_ASPECT_DEPTH_BIT) && (da & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+            copies[ncopies++] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, slv, sly, 1}, .srcOffset = {sx0, sy0, 0},
+                                              .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, dlv, dly, 1}, .dstOffset = {dx0, dy0, 0},
+                                              .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
+        }
+        if ((sa & VK_IMAGE_ASPECT_STENCIL_BIT) && (da & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            copies[ncopies++] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, slv, sly, 1}, .srcOffset = {sx0, sy0, 0},
+                                              .dstSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, dlv, dly, 1}, .dstOffset = {dx0, dy0, 0},
+                                              .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
+        }
+        if (!ncopies) {
+            copies[ncopies++] = (VkImageCopy){.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0},
+                                              .dstSubresource = {da, dlv, dly, 1}, .dstOffset = {dx0, dy0, 0},
+                                              .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
+        }
+        vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, ncopies, copies);
         return;
     }
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked
