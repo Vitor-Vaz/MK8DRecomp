@@ -820,6 +820,90 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// TLD4: texture gather (4 texels) full form
+static void emit_tld4(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1), dc = bits(w, 50, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    int comp = (int)bits(w, 56, 2);
+    int type = target == 0 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D)
+             : target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D)
+             : target == 2 ? TEXTYPE_3D
+                           : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
+    int ncoord = target == 0 ? 1 : target == 1 ? 2 : 3;
+    int slot = tex_slot(c, index, type, dc, array);
+    if (c->glsl) {
+        char coords[256];
+        if (ncoord == 2 && !array) {
+            c->reg_used[a] = 1; c->reg_used[a + 1] = 1;
+            sprintf(coords, "vec2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
+        } else if (ncoord == 2 && array) {
+            c->reg_used[a] = 1; c->reg_used[a + 1] = 1; c->reg_used[a + 2] = 1;
+            sprintf(coords, "vec3(as_type<float>(r%d), as_type<float>(r%d), float(r%d))", a + 1, a + 2, a);
+        } else {
+            c->reg_used[a] = 1; c->reg_used[a + 1] = 1;
+            sprintf(coords, "vec2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
+        }
+        char gcall[512];
+        if (dc) {
+            int dref_reg = b != RZ ? b : a + ncoord;
+            c->reg_used[dref_reg] = 1;
+            sprintf(gcall, "textureGather(t%d, %s, as_type<float>(r%d))", slot, coords, dref_reg);
+        } else {
+            sprintf(gcall, "textureGather(t%d, %s, %d)", slot, coords, comp);
+        }
+        write_tex_result(c, slot, gcall, mask, d, RZ, false, false);
+        return;
+    }
+    static const char *comps[] = {"x", "y", "z", "w"};
+    char coords[256];
+    if (ncoord == 2) {
+        c->reg_used[a] = 1; c->reg_used[a + 1] = 1;
+        sprintf(coords, "float2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
+    } else {
+        c->reg_used[a] = 1; c->reg_used[a + 1] = 1;
+        sprintf(coords, "float2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
+    }
+    char call[512];
+    if (dc) {
+        int dref_reg = b != RZ ? b : a + ncoord;
+        c->reg_used[dref_reg] = 1;
+        sprintf(call, "float4(t%d.gather_compare(s%d, %s, as_type<float>(r%d)))", slot, slot, coords, dref_reg);
+    } else {
+        sprintf(call, "t%d.gather(s%d, %s, component::%s)", slot, slot, coords, comps[comp]);
+    }
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TLD4S: texture gather (4 texels) short form
+static void emit_tld4s(Ctx *c, uint64_t w) {
+    int d0 = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8), d1 = (int)bits(w, 28, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    bool dc = bits(w, 50, 1);
+    int comp = (int)bits(w, 52, 2);
+    int slot = tex_slot(c, index, TEXTYPE_2D, dc, false);
+    char ra[16], rb[16];
+    const char *A = reg(c, a, ra), *Bv = reg(c, b, rb);
+    char call[512];
+    if (c->glsl) {
+        if (dc) {
+            sprintf(call, "textureGather(t%d, vec2(as_type<float>(%s), as_type<float>(%s)), 0.0f)", slot, A, Bv);
+        } else {
+            sprintf(call, "textureGather(t%d, vec2(as_type<float>(%s), as_type<float>(%s)), %d)", slot, A, Bv, comp);
+        }
+    } else {
+        static const char *comps[] = {"x", "y", "z", "w"};
+        if (dc) {
+            sprintf(call, "float4(t%d.gather_compare(s%d, float2(as_type<float>(%s), as_type<float>(%s)), 0.0f))", slot, slot, A, Bv);
+        } else {
+            sprintf(call, "t%d.gather(s%d, float2(as_type<float>(%s), as_type<float>(%s)), component::%s)", slot, slot, A, Bv, comps[comp]);
+        }
+    }
+    write_tex_result(c, slot, call, 0xf, d0, d1, true, false);
+}
+
 // TLD: texelFetch (unfiltered texture load by integer coordinates)
 static void emit_tld(Ctx *c, uint64_t w) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
@@ -979,11 +1063,13 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
         emit_texs(c, w, true);
-    } else if (OPM(0xc038000000000000ull, 0xf4fd000000000000ull)) {  // TEX
+    } else if (OPM(0xc038000000000000ull, 0xfc39000000000000ull)) {  // TEX
         emit_tex(c, w, false);
+    } else if (OPM(0xc838000000000000ull, 0xfc39000000000000ull)) {  // TLD4
+        emit_tld4(c, w);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
-    } else if (OPM(0xdf00000000000000ull, 0xfff0000000000000ull)) {  // TLD
+    } else if (OPM(0xdc38000000000000ull, 0xfe38000000000000ull)) {  // TLD
         emit_tld(c, w);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
@@ -1021,6 +1107,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         } else {
             fail(c, "txq type %d", qt);
         }
+    } else if (OPM(0xdf00000000000000ull, 0xffc0000000000000ull)) {  // TLD4S
+        emit_tld4s(c, w);
     } else if (OPM(0x5080000000000000ull, 0xfff8000000000000ull)) {  // MUFU
         int fn = (int)bits(w, 20, 4);
         const char *x = NA(F(R(a)), bits(w, 48, 1), bits(w, 46, 1));
@@ -1995,7 +2083,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
-    if (!blob || (stage != STAGE_COMPUTE && max_size < 0x80) || (stage == STAGE_COMPUTE && max_size < 8)) {
+    if (!blob || (uintptr_t)blob < 0x10000 || (uintptr_t)blob >= 0x800000000000ull ||
+        (stage != STAGE_COMPUTE && max_size < 0x80) || (stage == STAGE_COMPUTE && max_size < 8)) {
         snprintf(info->error, sizeof(info->error), "null or truncated shader blob");
         return info;
     }

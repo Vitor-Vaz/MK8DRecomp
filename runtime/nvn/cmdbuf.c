@@ -129,8 +129,11 @@ static CmdRec *record_copy(Cpu *c, uint32_t op, int arg, uint32_t len) {
 // ---- state binding
 NVN(nvnCommandBufferBindProgram) {
     Snap s = snap(c);
-    CmdRec *r = record(c, CMD_BIND_PROGRAM, 0, &s);
-    r->x[0] = (uint64_t)(uintptr_t)HOST(NvnProgram, s.x[1]);  // host program
+    CmdRec *r = record(c, CMD_BIND_PROGRAM, sizeof(NvnProgram), &s);
+    NvnProgram *p = HOST(NvnProgram, s.x[1]);
+    if (p) memcpy(r->extra, p, sizeof(NvnProgram));
+    else memset(r->extra, 0, sizeof(NvnProgram));
+    r->x[0] = (uint64_t)(uintptr_t)r->extra;  // snapshot embedded in command buffer
 }
 NVN(nvnCommandBufferBindBlendState) { record_copy(c, CMD_BIND_BLEND, 1, 8); }
 NVN(nvnCommandBufferBindChannelMaskState) { record_copy(c, CMD_BIND_CHANNEL_MASK, 1, 4); }
