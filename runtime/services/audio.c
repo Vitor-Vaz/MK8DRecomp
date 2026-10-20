@@ -922,9 +922,11 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
     o += oh[8];
     oh[1] = 0xB0;  // behavior / error info
     o += 0xB0;
-    oh[10] = 0x10;  // render info: elapsed frame count
-    if (o + 0x10 <= out->size) *(uint64_t *)(op + o) = elapsed;
-    o += 0x10;
+    if (o + 0x10 <= out->size) {
+        oh[10] = 0x10;  // render info: elapsed frame count (REV8+)
+        *(uint64_t *)(op + o) = elapsed;
+        o += 0x10;
+    }
     oh[15] = o;
     (void)resp;
 }
@@ -1019,7 +1021,7 @@ SERVICE("audren:u", audren_u) {
         ipc_return_object(resp, service_new("IAudioRenderer", audio_renderer, r));
         break;
     }
-    case 1: OUT(uint64_t, 0) = 0x1000000; resp_size(resp, 8); break;  // GetWorkBufferSize: 16 MB
+    case 1: OUT(uint64_t, 0) = 0x40000; resp_size(resp, 8); break;  // GetWorkBufferSize: 256 KB
     case 2: case 4: ipc_return_object(resp, service_new("IAudioDevice", audio_device, NULL)); break;
     default: LOG("[audren] cmd %u (ok)\n", req->cmd);
     }

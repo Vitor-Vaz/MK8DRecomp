@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../hle.h"
 #include "../settings.h"
@@ -161,9 +162,43 @@ static void signal_guest_event(Cpu *c, uint64_t event) {
 
 static void ok(Cpu *c) { c->x[0] = 0; }
 
+extern bool fs_romfs_find_file(const char *rel_path, int *out_fd, uint64_t *out_off, uint64_t *out_size);
+
+typedef struct {
+    int fd;
+    uint64_t off, size, pos;
+} RomAvio;
+
+static int rom_avio_read(void *opaque, uint8_t *buf, int buf_size) {
+    RomAvio *r = opaque;
+    if (r->pos >= r->size) return AVERROR_EOF;
+    uint64_t rem = r->size - r->pos;
+    if ((uint64_t)buf_size > rem) buf_size = (int)rem;
+    ssize_t n = pread(r->fd, buf, (size_t)buf_size, (off_t)(r->off + r->pos));
+    if (n <= 0) return AVERROR_EOF;
+    r->pos += (uint64_t)n;
+    return (int)n;
+}
+
+static int64_t rom_avio_seek(void *opaque, int64_t offset, int whence) {
+    RomAvio *r = opaque;
+    if (whence == AVSEEK_SIZE) return (int64_t)r->size;
+    int64_t np = 0;
+    if (whence == SEEK_SET) np = offset;
+    else if (whence == SEEK_CUR) np = (int64_t)r->pos + offset;
+    else if (whence == SEEK_END) np = (int64_t)r->size + offset;
+    else return -1;
+    if (np < 0) np = 0;
+    if ((uint64_t)np > r->size) np = (int64_t)r->size;
+    r->pos = (uint64_t)np;
+    return np;
+}
+
 // ------------------------------------------------------------------ Extractor
 typedef struct {
     AVFormatContext *fmt;
+    AVIOContext *avio;
+    RomAvio *rom_io;
     int map[16], ntracks;  // exposed track -> stream
     uint64_t selected;  // bitmask of streams
     AVPacket *pkt;
@@ -212,14 +247,41 @@ static void ex_fill(Extractor *e) {
 
 static void ex_set_data_source(Cpu *c) {
     Extractor *e = self_state(c);
-    const char *path = (const char *)(uintptr_t)c->x[2];
+    uint64_t p_arg = (c->x[1] >= GUEST_LO && c->x[1] < GUEST_HI) ? c->x[1] : c->x[2];
+    const char *path = (const char *)(uintptr_t)p_arg;
     // "rom:/region_common/movie/title.webm" -> extracted/romfs/region_common/movie/title.webm
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path;
+    while (rel && *rel == '/') rel++;
     char host[1024];
-    snprintf(host, sizeof host, "%s/%s", g_romfs_dir, rel ? rel : "");
+    snprintf(host, sizeof host, "%s/%s", g_romfs_dir ? g_romfs_dir : "extracted/romfs", rel ? rel : "");
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
-    if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
-        LOG("[movie] cannot open %s\n", host);
+    if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0) {
+        int fd = -1;
+        uint64_t off = 0, size = 0;
+        if (fs_romfs_find_file(rel, &fd, &off, &size)) {
+            e->rom_io = calloc(1, sizeof(RomAvio));
+            e->rom_io->fd = fd;
+            e->rom_io->off = off;
+            e->rom_io->size = size;
+            uint8_t *iobuf = av_malloc(64 * 1024);
+            e->avio = avio_alloc_context(iobuf, 64 * 1024, 0, e->rom_io, rom_avio_read, NULL, rom_avio_seek);
+            e->fmt = avformat_alloc_context();
+            e->fmt->pb = e->avio;
+            if (avformat_open_input(&e->fmt, rel, NULL, NULL) < 0) {
+                LOG("[movie] cannot open %s from romfs.bin\n", rel);
+                c->x[0] = 1;
+                return;
+            }
+            LOG("[movie] opened %s from romfs.bin (off=0x%llx, size=%llu)\n",
+                rel, (unsigned long long)off, (unsigned long long)size);
+        } else {
+            LOG("[movie] cannot open %s\n", host);
+            c->x[0] = 1;
+            return;
+        }
+    }
+    if (avformat_find_stream_info(e->fmt, NULL) < 0) {
+        LOG("[movie] cannot find stream info for %s\n", host);
         c->x[0] = 1;
         return;
     }
@@ -373,7 +435,7 @@ EX_LOCKED(ex_set_data_source)
 HLE_FUNC("_ZN5movie9ExtractorC1ENS_13ContainerTypeE", movie_extractor_ctor) {
     uint64_t vt = g_ex_vt;
     if (!vt) {
-        HostFn f[16] = {ex_dtor_l, ex_dtor_l, movie_log_slot, movie_log_slot, ex_get_track_count_l,
+        HostFn f[16] = {ex_dtor_l, ex_dtor_l, ex_set_data_source_l, movie_log_slot, ex_get_track_count_l,
                         ex_get_track_config_l, ex_select_track_l, movie_log_slot, ex_seek_l, ex_get_sample_track_l,
                         ex_read_l, ex_advance_l, ex_get_sample_time_l, movie_log_slot, ex_cached_duration_l,
                         ex_set_data_source_l};
@@ -793,4 +855,8 @@ HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11Dec
     pthread_mutex_init(&d->lock, NULL);
     self[0] = vt;
     self[1] = (uint64_t)(uintptr_t)d;
+}
+
+HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", movie_decoder_ctor_3arg) {
+    movie_decoder_ctor(c);
 }

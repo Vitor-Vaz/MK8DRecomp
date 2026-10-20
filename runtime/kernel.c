@@ -1,8 +1,14 @@
 // A small Horizon kernel: handles, threads, synchronization, memory, and the SVC dispatcher.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #include "hle.h"
 #include "kernel.h"
@@ -198,14 +204,26 @@ static void *thread_main(void *arg) {
     return NULL;
 }
 
+static void pin_thread_core(KThread *t) {
+#if defined(__linux__)
+    if (!t || !t->started) return;
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(t->core & 3, &cpuset);
+    pthread_setaffinity_np(t->host, sizeof(cpuset), &cpuset);
+#else
+    (void)t;
+#endif
+}
+
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = prio;
-    t->core = core < 0 ? 0 : core;
     t->id = next_thread_id++;
+    t->core = (core >= 0 && core < 4) ? core : (int)(t->id % 3);
     t->cpu.x[0] = arg;
     t->cpu.sp = stack_top & ~15ull;
     t->cpu.excl_addr = ~0ull;
@@ -227,6 +245,7 @@ static void thread_start(KThread *t) {
     t->started = true;
     pthread_create(&t->host, &attr, thread_main, t);
     pthread_attr_destroy(&attr);
+    pin_thread_core(t);
 }
 
 KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio) {
@@ -639,7 +658,19 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         x[2] = 0xF;
         break;
     }
-    case 0x0F: x[0] = R_OK; break;  // SetThreadCoreMask
+    case 0x0F: {  // SetThreadCoreMask(handle, core, mask)
+        KObject *o = handle_get((uint32_t)x[0]);
+        if (o && o->type == KOBJ_THREAD) {
+            KThread *t = (KThread *)o;
+            int core = (int)(int32_t)x[1];
+            uint64_t mask = x[2] & 0xF;
+            if (core >= 0 && core < 4) t->core = core;
+            else if (mask && !(mask & (1u << t->core))) t->core = __builtin_ctzll(mask);
+            pin_thread_core(t);
+        }
+        x[0] = o ? R_OK : R_INVALID_HANDLE;
+        break;
+    }
     case 0x10: x[0] = t_cur->core; break;  // GetCurrentProcessorNumber
     case 0x11: case 0x12: case 0x17: {  // SignalEvent / ClearEvent / ResetSignal
         pthread_mutex_lock(&g_klock);

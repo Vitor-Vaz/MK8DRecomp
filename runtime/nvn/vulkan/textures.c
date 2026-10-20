@@ -246,20 +246,24 @@ void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags as
 }
 
 // Images destroyed by the guest are kept until the submissions that may use them have completed.
-typedef struct { VkImage img; VmaAllocation mem; VkImageView view; uint64_t seq; } Dead;
+typedef struct { VkImage img; VmaAllocation mem; VkImageView view; void *ptr; uint64_t seq; } Dead;
 static Dead *dead;
 static int ndead, cap_dead;
+static pthread_mutex_t dead_lock = PTHREAD_MUTEX_INITIALIZER;
 static void views_forget(TexBackend *b);
 
 void vk_collect_dead(void) {
     uint64_t done = vk_completed_seq();
+    pthread_mutex_lock(&dead_lock);
     int k = 0;
     for (int i = 0; i < ndead; i++) {
         if (dead[i].seq > done) { dead[k++] = dead[i]; continue; }
-        if (dead[i].view) vkDestroyImageView(g_vk.dev, dead[i].view, NULL);
+        if (dead[i].ptr) free(dead[i].ptr);
+        else if (dead[i].view) vkDestroyImageView(g_vk.dev, dead[i].view, NULL);
         else vmaDestroyImage(g_vk.vma, dead[i].img, dead[i].mem);
     }
     ndead = k;
+    pthread_mutex_unlock(&dead_lock);
 }
 
 static void create_image(NvnTexture *t, TexBackend *b) {
@@ -357,13 +361,16 @@ static void create_image(NvnTexture *t, TexBackend *b) {
 }
 
 static void defer(Dead d) {
+    pthread_mutex_lock(&dead_lock);
     if (ndead == cap_dead) { cap_dead = cap_dead ? cap_dead * 2 : 256; dead = realloc(dead, cap_dead * sizeof *dead); }
     d.seq = vk_pending_seq();
     dead[ndead++] = d;
+    pthread_mutex_unlock(&dead_lock);
 }
 
 void vk_defer_image(VkImage img, VmaAllocation mem) { defer((Dead){.img = img, .mem = mem}); }
 void vk_defer_view(VkImageView v) { defer((Dead){.view = v}); }
+void vk_defer_free(void *ptr) { if (ptr) defer((Dead){.ptr = ptr}); }
 
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv);  // (exec.c: LARECOMP_VK_DEVLOST_TRACE)
 
@@ -484,14 +491,19 @@ static void upload_pending(TexBackend *b) {
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
 static void upload_texture(NvnTexture *t, TexBackend *b) {
-    if (!t->addr || t->target == 10) return;
+    if (!t || !t->addr || t->target == 10 || !b || !b->image) return;
+    const FormatInfo *fi = t->layout.fmt;
+    if (!fi || !fi->bpb) return;
+    if (t->layout.width > 16384 || t->layout.height > 16384 || t->layout.depth > 2048) return;
     uint64_t frame = vk_frame_counter();
     if (b->uploaded && b->checked_frame == frame) return;
     if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
-    const FormatInfo *fi = t->layout.fmt;
-    if (!fi || !fi->bpb) return;
     VkFmt mf = fmt_of(t->format);
     uint64_t total = tegra_total_size(&t->layout);
+    if (t->pool && t->pool->size && t->pool_offset + total > t->pool->size) {
+        total = t->pool->size > t->pool_offset ? t->pool->size - t->pool_offset : 0;
+    }
+    if (!total) return;
     b->checked_frame = frame;
     prof_tex_checks++;
     if (t->flags & 0x10) b->dynamic = true;
@@ -565,7 +577,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             uint64_t sz = (uint64_t)row * l.hb * l.d;
             bool expand = mf.expand_rgb && fi->bpb == 3;
             uint32_t out_row = expand ? l.wb * 4 : row;
-            VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
+            uint64_t span_sz = (uint64_t)out_row * l.hb * l.d;
+            if (span_sz > (512ull << 20)) {
+                LOG("[vk] BAD SPAN SIZE: span_sz=%llu (out_row=%u, wb=%u, hb=%u, d=%u, bpb=%u, fmt=0x%x, %ux%u)\n",
+                    (unsigned long long)span_sz, out_row, l.wb, l.hb, l.d, fi->bpb, t->format, t->width, t->height);
+                continue;
+            }
+            VkSpan s = vk_transient(span_sz, 16);
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
@@ -600,7 +618,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
 }
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
+    if (!t) return NULL;
     TexBackend *b = tex_backend(t);
+    if (!b) return NULL;
     if (b->pending_rgba) upload_pending(b);
     if (for_render) b->gpu_owned = true;
     else if (!b->gpu_owned) {
@@ -612,8 +632,15 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     return b;
 }
 
-void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
-bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
+void renderer_mark_gpu_owned(NvnTexture *t) {
+    if (!t) return;
+    TexBackend *b = tex_backend(t);
+    if (b) b->gpu_owned = true;
+}
+bool renderer_is_gpu_owned(NvnTexture *t) {
+    if (!t || !t->backend) return false;
+    return ((TexBackend *)t->backend)->gpu_owned;
+}
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
@@ -689,7 +716,9 @@ static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_CO
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
+    if (!t) return VK_NULL_HANDLE;
     TexBackend *b = vk_tex(t, render);
+    if (!b || !b->image) return VK_NULL_HANDLE;
     if (!has_view) v = NULL;
     VkFormat fmt = b->format;
     if (v && (v->setmask & 4) && !(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {

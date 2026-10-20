@@ -337,10 +337,24 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
+bool fs_romfs_find_file(const char *rel_path, int *out_fd, uint64_t *out_off, uint64_t *out_size) {
+    if (!rel_path || romfs_fd < 0) return false;
+    while (*rel_path == '/') rel_path++;
+    for (int i = 0; i < rom_nfiles; i++) {
+        if (strcmp(rom_files[i].path, rel_path) == 0) {
+            *out_fd = romfs_fd;
+            *out_off = rom_files[i].off;
+            *out_size = rom_files[i].size;
+            return true;
+        }
+    }
+    return false;
+}
+
 void romfs_file_read_hook(const char *path);
 
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
-typedef struct { int fd; uint64_t size; } Storage;
+typedef struct { int fd; uint64_t size; const uint8_t *mem; } Storage;
 
 static void storage(Service *s, IpcReq *req, IpcResp *resp) {
     Storage *st = s->state;
@@ -350,7 +364,22 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *b = out_buf(req, 0);
         if (!b) { resp->result = MAKE_RESULT(2, 6001); break; }
         if (size > b->size) size = b->size;
-        ssize_t n = romfs_read(st->fd, (uint8_t *)(uintptr_t)b->addr, size, off);
+        uint8_t *dst = (uint8_t *)(uintptr_t)b->addr;
+        if (st->mem) {
+            memset(dst, 0, size);
+            if (off < st->size) {
+                uint64_t avail = st->size - off;
+                memcpy(dst, st->mem + off, (size_t)(size < avail ? size : avail));
+            }
+            break;
+        }
+        if (st->fd != romfs_fd) {
+            ssize_t n = pread(st->fd, dst, size, (off_t)off);
+            if (n < 0) n = 0;
+            if ((uint64_t)n < size) memset(dst + n, 0, size - (uint64_t)n);
+            break;
+        }
+        ssize_t n = romfs_read(st->fd, dst, size, off);
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         {
             const char *path = romfs_file_at(off);
@@ -367,7 +396,7 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         if ((reads & (reads - 1)) == 0) LOG("[fs] romfs reads: %llu (%llu KB)\n", reads, bytes >> 10);
         break;
     }
-    case 4: OUT(uint64_t, 0) = ov_n ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize
+    case 4: OUT(uint64_t, 0) = (st->fd == romfs_fd && ov_n) ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize
     default: LOG("[fs] IStorage cmd %u (ok)\n", req->cmd);
     }
 }
@@ -386,6 +415,26 @@ static Service *open_romfs_storage(void) {
     fstat(romfs_fd, &sb);
     st->size = sb.st_size;
     return service_new("IStorage(romfs)", storage, st);
+}
+
+static Service *open_sys_storage(uint64_t data_id) {
+    char path[1024];
+    const char *slash = strrchr(g_romfs_dir, '/');
+    int dirlen = slash ? (int)(slash - g_romfs_dir) : (int)strlen(g_romfs_dir);
+    snprintf(path, sizeof path, "%.*s/sys_%llx.bin", dirlen, g_romfs_dir, (unsigned long long)(data_id & 0xFFFF));
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        struct stat sb;
+        fstat(fd, &sb);
+        Storage *st = calloc(1, sizeof *st);
+        st->fd = fd;
+        st->size = sb.st_size;
+        LOG("[fs] OpenDataStorageByDataId %llx -> %s (%llu KB)\n",
+            (unsigned long long)data_id, path, (unsigned long long)(st->size >> 10));
+        return service_new("IStorage(sys)", storage, st);
+    }
+    LOG("[fs] OpenDataStorageByDataId %llx (not available, tried %s)\n", (unsigned long long)data_id, path);
+    return NULL;
 }
 
 // ------------------------------------------------------------------ host-directory filesystem
@@ -606,10 +655,12 @@ SERVICE("fsp-srv", fsp_srv) {
         break;
     }
     case 200: ipc_return_object(resp, open_romfs_storage()); break;  // OpenDataStorageByCurrentProcess
-    case 202:  // OpenDataStorageByDataId (system data archives)
-        LOG("[fs] OpenDataStorageByDataId %llx (not available)\n", IN(uint64_t, 8));
-        resp->result = MAKE_RESULT(2, 1001);
+    case 202: {  // OpenDataStorageByDataId (system data archives)
+        Service *sys = open_sys_storage(IN(uint64_t, 8));
+        if (sys) ipc_return_object(resp, sys);
+        else resp->result = MAKE_RESULT(2, 1001);
         break;
+    }
     case 1005: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetGlobalAccessLogMode
     case 1003: case 1004: case 1006: break;
     case 1011: memset(resp->data, 0, 0x10); resp_size(resp, 0x10); break;
