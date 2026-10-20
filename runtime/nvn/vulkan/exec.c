@@ -1246,7 +1246,11 @@ static void translate_program(void *arg) {
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
-    if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+    if (!np || !(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+    for (int i = 0; i < 2; i++) {
+        uint64_t a = np->stages[i].code_addr;
+        if (!a || a < 0x10000 || a >= 0x800000000000ull) return NULL;
+    }
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     const uint8_t *vb = (const uint8_t *)vkey;
