@@ -19,6 +19,7 @@
 typedef struct NvnPool {
     uint64_t storage, size;
     uint32_t flags;
+    bool owns_storage;
 } NvnPool;
 
 typedef struct NvnTexture {

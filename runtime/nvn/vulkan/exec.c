@@ -459,6 +459,7 @@ static Chunk *chunks;
 static int nchunks, active = -1;
 
 static int new_chunk(uint64_t size) {
+    LOG("[vk] new_chunk: size=%llu MB (nchunks=%d)\n", (unsigned long long)(size >> 20), nchunks);
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
     Chunk *c = &chunks[nchunks];
     memset(c, 0, sizeof *c);
@@ -470,7 +471,12 @@ static int new_chunk(uint64_t size) {
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("LARECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
-    VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info));
+    VkResult res = vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info);
+    if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        res = vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info);
+    }
+    VK_CHECK(res);
     c->ptr = info.pMappedData;
     c->size = size;
     if (!nchunks) {  // where the ring lives: device-local (resizable BAR) or system memory read across PCIe
@@ -501,7 +507,17 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     int pick = -1;
     for (int i = 0; i < nchunks; i++)
         if (i != active && chunks[i].seq <= done && chunks[i].size >= size) { pick = i; break; }
-    if (pick < 0) pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
+    if (pick < 0) {
+        if (nchunks >= 4) {
+            int oldest = 0;
+            for (int i = 1; i < nchunks; i++)
+                if (chunks[i].seq < chunks[oldest].seq && chunks[i].size >= size) oldest = i;
+            vk_wait_seq(chunks[oldest].seq);
+            pick = oldest;
+        } else {
+            pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
+        }
+    }
     active = pick;
     chunks[pick].used = size;
     chunks[pick].seq = pending;
@@ -903,7 +919,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(t);
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
         TexBackend *b = t->backend;
-        if (!v) continue;
+        if (!v || !b) continue;
         ca[i].imageView = v;
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -928,7 +944,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(st.rt.depth);
         VkImageView v = vk_view(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
         TexBackend *b = st.rt.depth->backend;
-        if (v && renderer_format_is_depth(st.rt.depth->format)) {
+        if (v && b && renderer_format_is_depth(st.rt.depth->format)) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
@@ -2308,32 +2324,36 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-        if (e->tex) {
-            // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
-            // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
-            // destroyed (eviction, image re-created) bumps vk_view_gen. LARECOMP_VK_NO_TEX_MEMO=1 disables.
-            extern uint32_t vk_view_gen;
-            extern uint64_t vk_frame_counter(void);
-            static int nomemo = -1;
-            if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
-            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
-            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
-            uint32_t ms = (uint32_t)((((uintptr_t)e->tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
-            if (!nomemo && memo[ms].tex == e->tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
-                memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
-                view = memo[ms].view;
-            } else {
-                view = vk_view(naliases ? alias_read(e->tex) : e->tex, &e->view, e->has_view, false, st_->type);
-                memo[ms].tex = e->tex; memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
-                memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
-            }
-            renderer_texture_scale(e->tex, &sc[0], &sc[1]);
-            wh[0] = e->tex->width; wh[1] = e->tex->height;
-            for (int k = 0; k < nfeedback; k++)
-                if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
-                    view = feedback_view[k];
-                    if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
+        NvnTexture *tex = e->tex;
+        if (tex && tex->backend) {
+            NvnTexture *src_tex = naliases ? alias_read(tex) : tex;
+            if (src_tex && src_tex->backend) {
+                // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
+                // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
+                // destroyed (eviction, image re-created) bumps vk_view_gen. LARECOMP_VK_NO_TEX_MEMO=1 disables.
+                extern uint32_t vk_view_gen;
+                extern uint64_t vk_frame_counter(void);
+                static int nomemo = -1;
+                if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
+                static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
+                uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
+                uint32_t ms = (uint32_t)((((uintptr_t)tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
+                if (!nomemo && memo[ms].tex == tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
+                    memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
+                    view = memo[ms].view;
+                } else {
+                    view = vk_view(src_tex, &e->view, e->has_view, false, st_->type);
+                    memo[ms].tex = tex; memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
+                    memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
                 }
+                renderer_texture_scale(tex, &sc[0], &sc[1]);
+                wh[0] = tex->width; wh[1] = tex->height;
+                for (int k = 0; k < nfeedback; k++)
+                    if (tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
+                        view = feedback_view[k];
+                        if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
+                    }
+            }
         }
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
@@ -3553,6 +3573,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
+        if (p < 0x10000) return;
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;

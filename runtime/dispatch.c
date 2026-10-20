@@ -146,6 +146,11 @@ static GuestFn dispatch_slow(Cpu *c) {
         if (overrides[i].addr == pc) return overrides[i].fn;
     GuestFn f = dispatch_lookup(pc);
     if (!f) {
+        uint64_t off = 1;
+        const char *sym = loader_symbol_at(pc, &off);
+        if (sym && off == 0) f = hle_lookup_impl(sym);
+    }
+    if (!f) {
         uint64_t off;
         const char *s = loader_symbol_at(c->x[30], &off);
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);

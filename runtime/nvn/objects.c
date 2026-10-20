@@ -187,12 +187,29 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
+    if (!p->storage && p->size) {
+        void *mem = calloc(1, p->size);
+        p->storage = (uint64_t)(uintptr_t)mem;
+        p->owns_storage = true;
+        LOG("[nvn] virtual memory pool initialized: size=0x%llx flags=0x%x -> storage=%p\n",
+            (unsigned long long)p->size, p->flags, mem);
+    }
     SET_HOST(A(0), p);
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    if (p) {
+        if (p->owns_storage && p->storage) free((void *)(uintptr_t)p->storage);
+        free(p);
+    }
+    SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
-NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
+NVN(nvnMemoryPoolMap) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    RET(p->owns_storage ? 0 : p->storage);
+}
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
 NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
 NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
@@ -201,7 +218,27 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
-NVN(nvnMemoryPoolMapVirtual) { RET(1); }
+NVN(nvnMemoryPoolMapVirtual) {
+    NvnPool *vp = HOST(NvnPool, A(0));
+    int n = (int)A(1);
+    const uint8_t *reqs = (const uint8_t *)AP(2);
+    // NVNmappingRequest: physicalPool@0x00, physicalOffset@0x08, virtualOffset@0x10, size@0x18, storageClass@0x20 (stride 0x28)
+    for (int i = 0; i < n && vp && vp->storage; i++) {
+        const uint8_t *r = reqs + i * 0x28;
+        uint64_t phys_guest = *(const uint64_t *)(r + 0x00);
+        uint64_t phys_off   = *(const uint64_t *)(r + 0x08);
+        uint64_t virt_off   = *(const uint64_t *)(r + 0x10);
+        uint64_t sz         = *(const uint64_t *)(r + 0x18);
+        if (phys_guest && sz && virt_off + sz <= vp->size) {
+            NvnPool *pp = HOST(NvnPool, phys_guest);
+            if (pp && pp->storage && phys_off + sz <= pp->size) {
+                memcpy((void *)(uintptr_t)(vp->storage + virt_off),
+                       (const void *)(uintptr_t)(pp->storage + phys_off), sz);
+            }
+        }
+    }
+    RET(1);
+}
 
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
@@ -364,9 +401,27 @@ NVN(nvnTextureInitialize) {
     SET_HOST(A(0), t);
     RET(1);
 }
+extern NvnDescPool *g_texture_pools[64];
+
+extern void vk_defer_free(void *ptr);
+
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
-    if (t) { backend_texture_destroyed(t); free(t); }
+    if (t) {
+        for (int p = 0; p < 64; p++) {
+            NvnDescPool *dp = g_texture_pools[p];
+            if (!dp || !dp->entries) continue;
+            NvnTexEntry *entries = (NvnTexEntry *)dp->entries;
+            for (int i = 0; i < dp->count; i++) {
+                if (entries[i].tex == t) {
+                    entries[i].tex = NULL;
+                    entries[i].has_view = false;
+                }
+            }
+        }
+        backend_texture_destroyed(t);
+        vk_defer_free(t);
+    }
     SET_HOST(A(0), 0);
 }
 NVN(nvnTextureSetDebugLabel) {
@@ -516,7 +571,17 @@ NVN(nvnTexturePoolInitialize) {
     desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnTexEntry), g_texture_pools);
     RET(1);
 }
-NVN(nvnTexturePoolFinalize) { (void)c; }
+NVN(nvnTexturePoolFinalize) {
+    NvnDescPool *d = HOST(NvnDescPool, A(0));
+    if (d) {
+        for (int i = 0; i < 64; i++) {
+            if (g_texture_pools[i] == d) g_texture_pools[i] = NULL;
+        }
+        free(d->entries);
+        free(d);
+        SET_HOST(A(0), 0);
+    }
+}
 NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
 NVN(nvnTexturePoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
 NVN(nvnTexturePoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }
@@ -537,7 +602,17 @@ NVN(nvnSamplerPoolInitialize) {
     desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnSamplerDesc), g_sampler_pools);
     RET(1);
 }
-NVN(nvnSamplerPoolFinalize) { (void)c; }
+NVN(nvnSamplerPoolFinalize) {
+    NvnDescPool *d = HOST(NvnDescPool, A(0));
+    if (d) {
+        for (int i = 0; i < 64; i++) {
+            if (g_sampler_pools[i] == d) g_sampler_pools[i] = NULL;
+        }
+        free(d->entries);
+        free(d);
+        SET_HOST(A(0), 0);
+    }
+}
 NVN(nvnSamplerPoolSetDebugLabel) { (void)c; }
 NVN(nvnSamplerPoolGetMemoryPool) { RET(G(uint64_t, A(0), 8)); }
 NVN(nvnSamplerPoolGetMemoryOffset) { RET(G(uint64_t, A(0), 16)); }

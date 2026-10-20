@@ -118,7 +118,8 @@ const char *loader_symbol_at(uint64_t addr, uint64_t *offset) {
         for (uint64_t i = 1; i < m->nsyms; i++) {
             Elf64Sym *s = sym(m, i);
             uint64_t a = m->base + s->value;
-            if (s->shndx && (s->info & 0xF) == 2 && a <= addr && a > best_addr) {
+            uint8_t st = s->info & 0xF;
+            if (s->shndx && (st == 2 || st == 0) && a <= addr && a > best_addr) {
                 best = symname(m, s);
                 best_addr = a;
             }

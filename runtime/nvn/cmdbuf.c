@@ -27,25 +27,38 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
     return r;
 }
 
+#define CMD_RING_SIZE (128ull << 20)
+static uint8_t *g_cmd_ring;
+static uint64_t g_cmd_ring_pos;
+
+static uint64_t cmd_ring_alloc(uint64_t chunk_sz) {
+    if (!g_cmd_ring) g_cmd_ring = calloc(1, CMD_RING_SIZE);
+    uint64_t pos = __atomic_fetch_add(&g_cmd_ring_pos, chunk_sz, __ATOMIC_RELAXED);
+    if ((pos % CMD_RING_SIZE) + chunk_sz > CMD_RING_SIZE) {
+        pos = __atomic_fetch_add(&g_cmd_ring_pos, chunk_sz, __ATOMIC_RELAXED);
+    }
+    uint64_t off = pos % (CMD_RING_SIZE - chunk_sz);
+    off &= ~7ull;
+    return (uint64_t)(uintptr_t)(g_cmd_ring + off);
+}
+
 NVN(nvnCommandBufferAddCommandMemory) {
     NvnCmdBuf *cb = cb_of(A(0));
-    uint64_t mem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
+    uint64_t chunk_sz = 0x10000;
+    uint64_t mem = cmd_ring_alloc(chunk_sz);
     if (cb->recording && cb->mem) {
         // chain the list being recorded into the new chunk
         CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
         j->x[0] = mem;
     }
     cb->mem = mem;
-    cb->size = size;
+    cb->size = chunk_sz;
     cb->used = 0;
 }
 NVN(nvnCommandBufferAddControlMemory) { (void)c; }
-NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->size); }
-NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used); }
-NVN(nvnCommandBufferGetCommandMemoryFree) {
-    NvnCmdBuf *cb = cb_of(A(0));
-    RET(cb->size > cb->used + JUMP_RESERVE ? cb->size - cb->used - JUMP_RESERVE : 0);
-}
+NVN(nvnCommandBufferGetCommandMemorySize) { RET(0x100000); }
+NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used < 0x8000 ? cb_of(A(0))->used : 0x8000); }
+NVN(nvnCommandBufferGetCommandMemoryFree) { RET(0x100000); }
 NVN(nvnCommandBufferGetControlMemorySize) { RET(0x10000); }
 NVN(nvnCommandBufferGetControlMemoryUsed) { RET(0); }
 NVN(nvnCommandBufferGetControlMemoryFree) { RET(0x10000); }
@@ -55,20 +68,20 @@ NVN(nvnCommandBufferSetMemoryCallbackData) { cb_of(A(0))->callback_data = A(1); 
 NVN(nvnCommandBufferGetMemoryCallbackData) { RET(cb_of(A(0))->callback_data); }
 NVN(nvnCommandBufferSetCommandMemoryCallbackEnabled) { (void)c; }
 
-// Reserve a record. May call back into the guest for more memory, so callers snapshot their
-// arguments first.
+// Reserve a record from the host command ring buffer.
 static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
+    (void)c;
     uint32_t size = (uint32_t)((sizeof(CmdRec) + extra + 7) & ~7u);
-    for (int tries = 0; !cb->mem || cb->used + size + JUMP_RESERVE > cb->size; tries++) {
-        if (!cb->callback || tries == 2) FATAL("nvn: out of command memory (need %u)\n", size);
-        uint64_t saved[8];
-        memcpy(saved, c->x, sizeof saved);
-        c->x[0] = cb->guest;
-        c->x[1] = 0;  // NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY
-        c->x[2] = size + JUMP_RESERVE;
-        c->x[3] = cb->callback_data;
-        guest_call(c, cb->callback);
-        memcpy(c->x, saved, sizeof saved);
+    if (!cb->mem || cb->used + size + JUMP_RESERVE > cb->size) {
+        uint64_t chunk_sz = size + JUMP_RESERVE > 0x10000 ? (size + JUMP_RESERVE + 0xFFF) & ~0xFFFull : 0x10000;
+        uint64_t mem = cmd_ring_alloc(chunk_sz);
+        if (cb->recording && cb->mem) {
+            CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
+            j->x[0] = mem;
+        }
+        cb->mem = mem;
+        cb->size = chunk_sz;
+        cb->used = 0;
     }
     CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
     cb->used += size;
@@ -77,8 +90,9 @@ static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
 
 NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
-    cb->recording = true;
+    cb->recording = false;
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
+    cb->recording = true;
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
 }
 NVN(nvnCommandBufferEndRecording) {

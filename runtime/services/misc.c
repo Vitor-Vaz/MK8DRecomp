@@ -66,3 +66,91 @@ static void mii_root(Service *s, IpcReq *req, IpcResp *resp) {
 }
 SERVICE("mii:e", mii_e) { mii_root(s, req, resp); }
 SERVICE("mii:u", mii_u) { mii_root(s, req, resp); }
+
+// ------------------------------------------------------------------ nn::crypto::detail bignum asm helpers (STT_NOTYPE in sdk)
+HLE_FUNC("nndetailCryptoBignumMulAddWords", crypto_bn_mul_add_words) {
+    uint32_t *rp = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *ap = (const uint32_t *)(uintptr_t)c->x[1];
+    int num = (int)c->x[2];
+    uint64_t w = (uint32_t)c->x[3], carry = 0;
+    for (int i = 0; i < num; i++) {
+        uint64_t t = (uint64_t)rp[i] + (uint64_t)ap[i] * w + carry;
+        rp[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+    c->x[0] = carry;
+}
+
+HLE_FUNC("nndetailCryptoBignumMulWords", crypto_bn_mul_words) {
+    uint32_t *rp = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *ap = (const uint32_t *)(uintptr_t)c->x[1];
+    int num = (int)c->x[2];
+    uint64_t w = (uint32_t)c->x[3], carry = 0;
+    for (int i = 0; i < num; i++) {
+        uint64_t t = (uint64_t)ap[i] * w + carry;
+        rp[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+    c->x[0] = carry;
+}
+
+HLE_FUNC("nndetailCryptoBignumAddWords", crypto_bn_add_words) {
+    uint32_t *rp = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *ap = (const uint32_t *)(uintptr_t)c->x[1];
+    const uint32_t *bp = (const uint32_t *)(uintptr_t)c->x[2];
+    int num = (int)c->x[3];
+    uint64_t carry = 0;
+    for (int i = 0; i < num; i++) {
+        uint64_t t = (uint64_t)ap[i] + (uint64_t)bp[i] + carry;
+        rp[i] = (uint32_t)t;
+        carry = t >> 32;
+    }
+    c->x[0] = carry;
+}
+
+HLE_FUNC("nndetailCryptoBignumSubWords", crypto_bn_sub_words) {
+    uint32_t *rp = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *ap = (const uint32_t *)(uintptr_t)c->x[1];
+    const uint32_t *bp = (const uint32_t *)(uintptr_t)c->x[2];
+    int num = (int)c->x[3];
+    uint64_t borrow = 0;
+    for (int i = 0; i < num; i++) {
+        uint64_t a = ap[i], b = (uint64_t)bp[i] + borrow;
+        rp[i] = (uint32_t)(a - b);
+        borrow = a < b ? 1 : 0;
+    }
+    c->x[0] = borrow;
+}
+
+HLE_FUNC("nndetailCryptoBignum_mul_comba8", crypto_bn_mul_comba8) {
+    uint32_t *r = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *a = (const uint32_t *)(uintptr_t)c->x[1];
+    const uint32_t *b = (const uint32_t *)(uintptr_t)c->x[2];
+    uint64_t acc[16] = {0};
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t t = acc[i + j] + (uint64_t)a[i] * (uint64_t)b[j] + carry;
+            acc[i + j] = (uint32_t)t;
+            carry = t >> 32;
+        }
+        acc[i + 8] = carry;
+    }
+    for (int i = 0; i < 16; i++) r[i] = (uint32_t)acc[i];
+}
+
+HLE_FUNC("nndetailCryptoBignum_sqr_comba8", crypto_bn_sqr_comba8) {
+    uint32_t *r = (uint32_t *)(uintptr_t)c->x[0];
+    const uint32_t *a = (const uint32_t *)(uintptr_t)c->x[1];
+    uint64_t acc[16] = {0};
+    for (int i = 0; i < 8; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 8; j++) {
+            uint64_t t = acc[i + j] + (uint64_t)a[i] * (uint64_t)a[j] + carry;
+            acc[i + j] = (uint32_t)t;
+            carry = t >> 32;
+        }
+        acc[i + 8] = carry;
+    }
+    for (int i = 0; i < 16; i++) r[i] = (uint32_t)acc[i];
+}
