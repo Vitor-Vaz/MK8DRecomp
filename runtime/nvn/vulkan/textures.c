@@ -171,10 +171,7 @@ void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 uint64_t renderer_present_count(void);
 
 static bool tex_scalable(const NvnTexture *t) {
-    if (getenv("LARECOMP_NO_SCALE")) return false;
-    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
-    float a = (float)t->width / (float)t->height;
-    return a > 1.74f && a < 1.81f;
+    return false;
 }
 
 bool renderer_texture_first_write(NvnTexture *t) {
@@ -250,6 +247,7 @@ typedef struct { VkImage img; VmaAllocation mem; VkImageView view; void *ptr; ui
 static Dead *dead;
 static int ndead, cap_dead;
 static pthread_mutex_t dead_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t view_lock = PTHREAD_MUTEX_INITIALIZER;
 static void views_forget(TexBackend *b);
 
 void vk_collect_dead(void) {
@@ -379,25 +377,34 @@ static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->heig
 
 static void destroy_image(TexBackend *b) {
     views_forget(b);
-    if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
+    pthread_mutex_lock(&view_lock);
+    VkImage img = b->image;
+    VmaAllocation mem = b->mem;
     b->image = VK_NULL_HANDLE;
     b->mem = VK_NULL_HANDLE;
+    pthread_mutex_unlock(&view_lock);
+    if (img || mem) defer((Dead){.img = img, .mem = mem});  // (never the same allocation twice)
 }
 
 // Live game textures: an in-place reboot (vk_textures_reset) destroys them all.
 static NvnTexture **g_live;
 static int g_nlive, g_cap_live;
+static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
 static void live_add(NvnTexture *t, TexBackend *b) {
+    pthread_mutex_lock(&live_lock);
     if (g_nlive == g_cap_live) { g_cap_live = g_cap_live ? g_cap_live * 2 : 1024; g_live = realloc(g_live, g_cap_live * sizeof *g_live); }
     g_live[g_nlive++] = t;
     b->reg = g_nlive;
+    pthread_mutex_unlock(&live_lock);
 }
 static void live_remove(TexBackend *b) {
-    if (!b->reg) return;
+    pthread_mutex_lock(&live_lock);
+    if (!b->reg) { pthread_mutex_unlock(&live_lock); return; }
     NvnTexture *last = g_live[--g_nlive];
     g_live[b->reg - 1] = last;
     if (last->backend) ((TexBackend *)last->backend)->reg = b->reg;
     b->reg = 0;
+    pthread_mutex_unlock(&live_lock);
 }
 
 static TexBackend *tex_backend(NvnTexture *t) {
@@ -669,34 +676,62 @@ void vk_views_forget(TexBackend *b) { views_forget(b); }
 uint32_t vk_view_gen;  // bumped whenever a cached view may be destroyed (exec.c's per-frame texture memo)
 static void views_forget(TexBackend *b) {
     vk_view_gen++;
+    pthread_mutex_lock(&view_lock);
     for (int i = 0; i < VIEW_TAB; i++)
         if (view_tab[i].b == b) { defer((Dead){.view = view_tab[i].view}); view_tab[i].b = NULL; view_tab[i].view = VK_NULL_HANDLE; }
+    pthread_mutex_unlock(&view_lock);
 }
 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect) {
+    if (!b) return VK_NULL_HANDLE;
+    VkImage img = b->image;
+    if (!img || b->levels == 0 || b->layers == 0) return VK_NULL_HANDLE;
+    if (lv0 >= b->levels) lv0 = b->levels - 1;
+    if (nlv == 0) nlv = 1;
+    if (lv0 + nlv > b->levels) nlv = b->levels - lv0;
+    if (ly0 >= b->layers) ly0 = b->layers - 1;
+    if (nly == 0) nly = 1;
+    if (ly0 + nly > b->layers) nly = b->layers - ly0;
+    if (!aspect) aspect = b->aspect;
+
     uint64_t k1 = (uint64_t)type | (uint64_t)fmt << 8 | (uint64_t)lv0 << 40 | (uint64_t)nlv << 48 | (uint64_t)aspect << 56;
     uint64_t k2 = (uint64_t)ly0 | (uint64_t)nly << 16 | (uint64_t)sw.r << 32 | (uint64_t)sw.g << 40 | (uint64_t)sw.b << 48 | (uint64_t)sw.a << 56;
     uint64_t h = ((uint64_t)(uintptr_t)b * 0x9E3779B97F4A7C15ull) ^ (k1 * 0xC2B2AE3D27D4EB4Full) ^ (k2 * 0x165667B19E3779F9ull);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VIEW_TAB - 1);
+    pthread_mutex_lock(&view_lock);
     for (int probe = 0; probe < 16; probe++, slot = (slot + 1) & (VIEW_TAB - 1)) {
         ViewEnt *e = &view_tab[slot];
-        if (e->b == b && e->k1 == k1 && e->k2 == k2) return e->view;
+        if (e->b == b && e->k1 == k1 && e->k2 == k2) {
+            VkImageView hit = e->view;
+            pthread_mutex_unlock(&view_lock);
+            return hit;
+        }
         if (!e->b) break;
     }
+    pthread_mutex_unlock(&view_lock);
+
     extern uint64_t prof_views_created;
     prof_views_created++;
-    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b->image, .viewType = type,
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = type,
                                 .format = fmt, .components = sw, .subresourceRange = {aspect, lv0, nlv, ly0, nly}};
+    if (!vi.image) return VK_NULL_HANDLE;
     VkImageView v;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &v) != VK_SUCCESS) {
         static int nfail;
         if (nfail++ < 20) LOG("[vk] view failed: type %d fmt %d (image fmt %d) levels %u+%u layers %u+%u\n", type, fmt, b->format, lv0, nlv, ly0, nly);
         return VK_NULL_HANDLE;
     }
+    pthread_mutex_lock(&view_lock);
+    if (!b->image || b->image != img) {
+        defer((Dead){.view = v});
+        pthread_mutex_unlock(&view_lock);
+        return v;
+    }
     ViewEnt *e = &view_tab[slot];
     if (e->b) { defer((Dead){.view = e->view}); vk_view_gen++; }  // evict (16 probes taken)
     *e = (ViewEnt){b, k1, k2, v};
+    pthread_mutex_unlock(&view_lock);
     return v;
 }
 
@@ -718,9 +753,9 @@ static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_CO
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
-    if (!t) return VK_NULL_HANDLE;
+    if (!t) return render ? VK_NULL_HANDLE : vk_dummy_view(want_textype);
     TexBackend *b = vk_tex(t, render);
-    if (!b || !b->image) return VK_NULL_HANDLE;
+    if (!b || !b->image) return render ? VK_NULL_HANDLE : vk_dummy_view(want_textype);
     if (!has_view) v = NULL;
     VkFormat fmt = b->format;
     if (v && (v->setmask & 4) && !(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
@@ -759,22 +794,25 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     VkImageViewType want = view_type_for(want_textype);
     VkImageViewType have = b->base_type;
     if (b->samples > 1) return vk_dummy_view(want_textype);  // multisampled images can't be sampled as 2D
+    VkImageView ret = VK_NULL_HANDLE;
     if (want == have) {
         if (have == VK_IMAGE_VIEW_TYPE_CUBE) nly = 6;
-        return vk_image_view(b, want, fmt, lv0, nlv, ly0, nly, sw, aspect);
+        ret = vk_image_view(b, want, fmt, lv0, nlv, ly0, nly, sw, aspect);
+    } else if (want == VK_IMAGE_VIEW_TYPE_2D && (have == VK_IMAGE_VIEW_TYPE_2D_ARRAY || have == VK_IMAGE_VIEW_TYPE_CUBE)) {
+        ret = vk_image_view(b, want, fmt, lv0, nlv, ly0, 1, sw, aspect);
+    } else if (want == VK_IMAGE_VIEW_TYPE_2D_ARRAY && (have == VK_IMAGE_VIEW_TYPE_2D || have == VK_IMAGE_VIEW_TYPE_CUBE)) {
+        ret = vk_image_view(b, want, fmt, lv0, nlv, ly0, have == VK_IMAGE_VIEW_TYPE_CUBE ? nly : 1, sw, aspect);
+    } else if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height) {
+        ret = vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
+    } else if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D) {
+        ret = vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
+    } else {
+        static int nlog;
+        if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
+                             t->height, t->depth, t->target, t->format, b->layers);
+        return vk_dummy_view(want_textype);
     }
-    if (want == VK_IMAGE_VIEW_TYPE_2D && (have == VK_IMAGE_VIEW_TYPE_2D_ARRAY || have == VK_IMAGE_VIEW_TYPE_CUBE))
-        return vk_image_view(b, want, fmt, lv0, nlv, ly0, 1, sw, aspect);
-    if (want == VK_IMAGE_VIEW_TYPE_2D_ARRAY && (have == VK_IMAGE_VIEW_TYPE_2D || have == VK_IMAGE_VIEW_TYPE_CUBE))
-        return vk_image_view(b, want, fmt, lv0, nlv, ly0, have == VK_IMAGE_VIEW_TYPE_CUBE ? nly : 1, sw, aspect);
-    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height)
-        return vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
-    if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
-        return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
-    static int nlog;
-    if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
-                         t->height, t->depth, t->target, t->format, b->layers);
-    return vk_dummy_view(want_textype);
+    return ret ? ret : vk_dummy_view(want_textype);
 }
 
 // 1x1 black textures for unbound slots, per type

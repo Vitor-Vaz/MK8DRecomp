@@ -210,9 +210,9 @@ NVN(nvnMemoryPoolMap) {
     NvnPool *p = HOST(NvnPool, A(0));
     RET(p->owns_storage ? 0 : p->storage);
 }
-NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
-NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
-NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
+NVN(nvnMemoryPoolGetBufferAddress) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->storage : 0); }  // GPU address == CPU address
+NVN(nvnMemoryPoolGetSize) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->size : 0); }
+NVN(nvnMemoryPoolGetFlags) { NvnPool *p = HOST(NvnPool, A(0)); RET(p ? p->flags : 0); }
 NVN(nvnMemoryPoolFlushMappedRange) {
     NvnPool *p = HOST(NvnPool, A(0));
     backend_pool_written(p->storage + A(1), A(2));
@@ -428,23 +428,28 @@ NVN(nvnTextureSetDebugLabel) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     if (t && A(1)) strncpy(t->label, (const char *)AP(1), sizeof t->label - 1);
 }
-#define TEX HOST(NvnTexture, A(0))
-NVN(nvnTextureGetFlags) { RET(TEX->flags); }
-NVN(nvnTextureGetTarget) { RET(TEX->target); }
-NVN(nvnTextureGetWidth) { RET(TEX->width); }
-NVN(nvnTextureGetHeight) { RET(TEX->height); }
-NVN(nvnTextureGetDepth) { RET(TEX->depth); }
-NVN(nvnTextureGetLevels) { RET(TEX->levels); }
-NVN(nvnTextureGetFormat) { RET(TEX->format); }
-NVN(nvnTextureGetSamples) { RET(TEX->samples); }
-NVN(nvnTextureGetSwizzle) { for (int i = 0; i < 4; i++) *(uint32_t *)AP(1 + i) = TEX->swizzle[i]; }
-NVN(nvnTextureGetDepthStencilMode) { RET(TEX->ds_mode); }
-NVN(nvnTextureGetStride) { RET(TEX->stride); }
-NVN(nvnTextureGetTextureAddress) { RET(TEX->addr); }
+NVN(nvnTextureGetFlags) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->flags : 0); }
+NVN(nvnTextureGetTarget) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->target : 0); }
+NVN(nvnTextureGetWidth) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->width : 0); }
+NVN(nvnTextureGetHeight) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->height : 0); }
+NVN(nvnTextureGetDepth) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->depth : 0); }
+NVN(nvnTextureGetLevels) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->levels : 0); }
+NVN(nvnTextureGetFormat) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->format : 0); }
+NVN(nvnTextureGetSamples) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->samples : 0); }
+NVN(nvnTextureGetSwizzle) {
+    NvnTexture *t = HOST(NvnTexture, A(0));
+    for (int i = 0; i < 4; i++) {
+        uint32_t *p = (uint32_t *)AP(1 + i);
+        if (p) *p = t ? t->swizzle[i] : i;
+    }
+}
+NVN(nvnTextureGetDepthStencilMode) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->ds_mode : 0); }
+NVN(nvnTextureGetStride) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->stride : 0); }
+NVN(nvnTextureGetTextureAddress) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->addr : 0); }
 NVN(nvnTextureGetMemoryPool) { RET(0); }
-NVN(nvnTextureGetMemoryOffset) { RET(TEX->pool_offset); }
-NVN(nvnTextureGetStorageSize) { RET(tegra_total_size(&TEX->layout)); }
-NVN(nvnTextureGetDebugID) { RET(TEX->debug_id); }
+NVN(nvnTextureGetMemoryOffset) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->pool_offset : 0); }
+NVN(nvnTextureGetStorageSize) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? tegra_total_size(&t->layout) : 0); }
+NVN(nvnTextureGetDebugID) { NvnTexture *t = HOST(NvnTexture, A(0)); RET(t ? t->debug_id : 0); }
 NVN(nvnTextureGetViewOffset) { RET(0); }
 NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
@@ -536,18 +541,46 @@ NVN(nvnSamplerInitialize) {
 }
 NVN(nvnSamplerFinalize) { free(HOST(NvnSamplerDesc, A(0))); SET_HOST(A(0), 0); }
 NVN(nvnSamplerSetDebugLabel) { (void)c; }
-#define SMP HOST(NvnSamplerDesc, A(0))
-NVN(nvnSamplerGetMinMagFilter) { *(uint32_t *)AP(1) = SMP->min_filter; *(uint32_t *)AP(2) = SMP->mag_filter; }
-NVN(nvnSamplerGetWrapMode) { for (int i = 0; i < 3; i++) *(uint32_t *)AP(1 + i) = SMP->wrap[i]; }
-NVN(nvnSamplerGetLodClamp) { *(float *)AP(1) = SMP->lod_min; *(float *)AP(2) = SMP->lod_max; }
-NVN(nvnSamplerGetLodBias) { RETF(SMP->lod_bias); }
-NVN(nvnSamplerGetCompare) { *(uint32_t *)AP(1) = SMP->compare_mode; *(uint32_t *)AP(2) = SMP->compare_func; }
-NVN(nvnSamplerGetBorderColor) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetBorderColori) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetBorderColorui) { memcpy(AP(1), SMP->border, 16); }
-NVN(nvnSamplerGetMaxAnisotropy) { RETF(SMP->max_aniso); }
-NVN(nvnSamplerGetReductionFilter) { RET(SMP->reduction); }
-NVN(nvnSamplerCompare) { RET(memcmp(HOST(NvnSamplerDesc, A(0)), HOST(NvnSamplerDesc, A(1)), sizeof(NvnSamplerDesc)) == 0); }
+NVN(nvnSamplerGetMinMagFilter) {
+    NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0));
+    if (s) {
+        if (AP(1)) *(uint32_t *)AP(1) = s->min_filter;
+        if (AP(2)) *(uint32_t *)AP(2) = s->mag_filter;
+    }
+}
+NVN(nvnSamplerGetWrapMode) {
+    NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0));
+    for (int i = 0; i < 3; i++) {
+        uint32_t *p = (uint32_t *)AP(1 + i);
+        if (p) *p = s ? s->wrap[i] : 0;
+    }
+}
+NVN(nvnSamplerGetLodClamp) {
+    NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0));
+    if (s) {
+        if (AP(1)) *(float *)AP(1) = s->lod_min;
+        if (AP(2)) *(float *)AP(2) = s->lod_max;
+    }
+}
+NVN(nvnSamplerGetLodBias) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); RETF(s ? s->lod_bias : 0.0f); }
+NVN(nvnSamplerGetCompare) {
+    NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0));
+    if (s) {
+        if (AP(1)) *(uint32_t *)AP(1) = s->compare_mode;
+        if (AP(2)) *(uint32_t *)AP(2) = s->compare_func;
+    }
+}
+NVN(nvnSamplerGetBorderColor) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); if (s && AP(1)) memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetBorderColori) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); if (s && AP(1)) memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetBorderColorui) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); if (s && AP(1)) memcpy(AP(1), s->border, 16); }
+NVN(nvnSamplerGetMaxAnisotropy) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); RETF(s ? s->max_aniso : 1.0f); }
+NVN(nvnSamplerGetReductionFilter) { NvnSamplerDesc *s = HOST(NvnSamplerDesc, A(0)); RET(s ? s->reduction : 0); }
+NVN(nvnSamplerCompare) {
+    void *a = HOST(NvnSamplerDesc, A(0));
+    void *b = HOST(NvnSamplerDesc, A(1));
+    if (!a || !b) RET(a == b);
+    RET(memcmp(a, b, sizeof(NvnSamplerDesc)) == 0);
+}
 NVN(nvnSamplerGetDebugID) { RET(A(0)); }
 
 // ================================================================== descriptor pools
