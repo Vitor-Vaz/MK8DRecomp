@@ -1221,18 +1221,18 @@ static void translate_program(void *arg) {
     maxwell_gmem_size = HEAP_MAX;
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
-    if (p->vi->msl) {
+    if (p->vi && p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
     pthread_mutex_unlock(&translate_lock);
-    if (!p->vi->msl) {
-        LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
+    if (!p->vi || !p->vi->msl) {
+        LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi ? p->vi->error : "null", (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
         return;
     }
-    if (!p->fi->msl) {
-        LOG("[shader] FS translate failed: %s\n", p->fi->error);
+    if (!p->fi || !p->fi->msl) {
+        LOG("[shader] FS translate failed: %s\n", p->fi ? p->fi->error : "null");
         atomic_store(&p->state, 2);
         return;
     }

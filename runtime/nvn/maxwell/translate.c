@@ -820,6 +820,72 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// TLD: texelFetch (unfiltered texture load by integer coordinates)
+static void emit_tld(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    int type = target == 0 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D)
+             : target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D)
+             : target == 2 ? TEXTYPE_3D
+                           : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
+    int ncoord = target == 0 ? 1 : target == 1 ? 2 : 3;
+    int slot = tex_slot(c, index, type, false, array);
+    bool is_ll = bits(w, 55, 1) || (b != RZ && b != 255);
+    int lod_reg = b;
+    if (c->glsl) {
+        char coords[256];
+        int ar = a;
+        if (ncoord == 1 && !array) {
+            c->reg_used[ar] = 1;
+            sprintf(coords, "int(r%d)", ar);
+        } else if (ncoord == 1 && array) {
+            c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1;
+            sprintf(coords, "ivec2(int(r%d), int(r%d))", ar + 1, ar);
+        } else if (ncoord == 2 && !array) {
+            c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1;
+            sprintf(coords, "ivec2(%s)", RSC2(c, slot, "uint2(r%d, r%d)", ar, ar + 1));
+        } else if (ncoord == 2 && array) {
+            c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1; c->reg_used[ar + 2] = 1;
+            sprintf(coords, "ivec3(int(r%d), int(r%d), int(r%d))", ar + 1, ar + 2, ar);
+        } else {
+            c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1; c->reg_used[ar + 2] = 1;
+            sprintf(coords, "ivec3(int(r%d), int(r%d), int(r%d))", ar, ar + 1, ar + 2);
+        }
+        char lod_str[32] = "0";
+        if (is_ll && lod_reg != RZ && lod_reg != 255) {
+            c->reg_used[lod_reg] = 1;
+            sprintf(lod_str, "int(r%d)", lod_reg);
+        }
+        char gcall[512];
+        sprintf(gcall, "texelFetch(t%d, %s, %s)", slot, coords, lod_str);
+        write_tex_result(c, slot, gcall, mask, d, RZ, false, false);
+        return;
+    }
+    char coords[256];
+    int ar = a;
+    if (ncoord == 1 && !array) {
+        c->reg_used[ar] = 1;
+        sprintf(coords, "uint(r%d)", ar);
+    } else if (ncoord == 2 && !array) {
+        c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1;
+        sprintf(coords, "uint2(r%d, r%d)", ar, ar + 1);
+    } else {
+        c->reg_used[ar] = 1; c->reg_used[ar + 1] = 1; c->reg_used[ar + 2] = 1;
+        sprintf(coords, "uint3(r%d, r%d, r%d)", ar, ar + 1, ar + 2);
+    }
+    char call[512];
+    if (is_ll && lod_reg != RZ && lod_reg != 255) {
+        c->reg_used[lod_reg] = 1;
+        sprintf(call, "t%d.read(%s, uint(r%d))", slot, coords, lod_reg);
+    } else {
+        sprintf(call, "t%d.read(%s)", slot, coords);
+    }
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -913,10 +979,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
         emit_texs(c, w, true);
-    } else if (OPM(0xc038000000000000ull, 0xfc38000000000000ull)) {  // TEX
+    } else if (OPM(0xc038000000000000ull, 0xf4fd000000000000ull)) {  // TEX
         emit_tex(c, w, false);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xdf00000000000000ull, 0xfff0000000000000ull)) {  // TLD
+        emit_tld(c, w);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
         int qt = (int)bits(w, 22, 6);
@@ -1927,6 +1995,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
+    if (!blob || (stage != STAGE_COMPUTE && max_size < 0x80) || (stage == STAGE_COMPUTE && max_size < 8)) {
+        snprintf(info->error, sizeof(info->error), "null or truncated shader blob");
+        return info;
+    }
     Ctx *c = calloc(1, sizeof *c);
     c->info = info;
     c->key = key;
