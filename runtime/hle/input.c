@@ -380,28 +380,7 @@ static void fill_state(Cpu *c) {
     *(int64_t *)s = ++sampling;
     static int nlog;
     if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, c->x[30]); }
-    if (id != 0) return;  // docked: only player 1 (FullKey); Handheld stays disconnected
-    extern void warp_game_tick(Cpu *c);
-    warp_game_tick(c);  // game main thread, once per frame: apply a queued warp
-    { extern void give_item_tick(Cpu *c, uint64_t frame); extern uint64_t renderer_present_count(void);
-      give_item_tick(c, renderer_present_count());
-      extern void chamber_game_tick(Cpu *c, uint64_t frame);
-      chamber_game_tick(c, renderer_present_count());
-      extern void digs_game_tick(Cpu *c, uint64_t frame);
-      digs_game_tick(c, renderer_present_count());
-      extern void qol_tick(void);
-      qol_tick();
-      extern void pets_game_tick(Cpu *c);
-      pets_game_tick(c); }
-    extern uint64_t g_watch_lo, g_watch_hi;
-    if (id == 0 && !g_pad_obj) g_pad_obj = c->x[1] - 8;
-    if (id == 0 && !g_watch_lo && getenv("LARECOMP_WATCH_PAD")) {
-        unsigned lo = 0x98 + 0x10, hi = 0x98 + 0x48;  // offsets from the controller manager
-        sscanf(getenv("LARECOMP_WATCH_PAD"), "%x,%x", &lo, &hi);
-        g_watch_lo = c->x[1] - 8 - 0x98 + lo;
-        g_watch_hi = c->x[1] - 8 - 0x98 + hi;
-        LOG("[input] watching controller object %llx\n", c->x[1] - 8);
-    }
+    if (id != 0 && id != 0x20) return;  // Player 1 (FullKey / JoyDual) or Handheld
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
     uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
@@ -412,33 +391,6 @@ static void fill_state(Cpu *c) {
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
-    extern bool mirror_input(void);  // mirror mode, the world on screen (runtime/hle/mirror.c): left and right swap
-    bool mirrored = !menu && mirror_input();
-    if (mirrored) {
-        lx = -lx;
-        uint64_t l = (b >> BTN_LEFT) & 1, r = (b >> BTN_RIGHT) & 1;
-        b = (b & ~((1ull << BTN_LEFT) | (1ull << BTN_RIGHT))) | (l << BTN_RIGHT) | (r << BTN_LEFT);
-    }
-    // d-pad / arrow keys walk (setting) while the stick is at rest. "At rest" has a dead zone: a controller's stick
-    // never reads exactly 0 (a DualSense rests at a few hundred), which used to turn the d-pad off altogether.
-    if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {
-        uint64_t d = key_buttons | pad_buttons | script_buttons;
-        int dx = (int)((d >> BTN_RIGHT) & 1) - (int)((d >> BTN_LEFT) & 1);
-        if (mirrored) dx = -dx;
-        int dy = (int)((d >> BTN_UP) & 1) - (int)((d >> BTN_DOWN) & 1);
-        int32_t m = dx && dy ? 23170 : 32767;  // diagonals: same speed (32767 / sqrt 2)
-        if (dx || dy) lx = dx * m, ly = dy * m;
-    }
-    {   // door jumps stop Link for a moment before moving him (runtime/hle/doorjump.c): stick + d-pad released
-        extern int32_t g_stick_lx, g_stick_ly;  // (what the player holds, before that: doorjump.c reads it)
-        g_stick_lx = lx, g_stick_ly = ly;
-        extern uint64_t g_stick_freeze_until;
-        extern uint64_t renderer_present_count(void);
-        if (renderer_present_count() < g_stick_freeze_until) {
-            lx = ly = 0;
-            b &= ~(0xfull << 12);
-        }
-    }
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;
@@ -448,12 +400,6 @@ static void fill_state(Cpu *c) {
     if (ry > 16000) b |= 1ull << 21;
     if (rx > 16000) b |= 1ull << 22;
     if (ry < -16000) b |= 1ull << 23;
-    {   // the pause menu's companion slot (runtime/hle/pets.c) takes the d-pad / sticks / A while the cursor is on it
-        extern uint64_t pets_menu_input(uint64_t b, int32_t st[4]);
-        int32_t st[4] = {lx, ly, rx, ry};
-        b = pets_menu_input(b, st);
-        lx = st[0], ly = st[1], rx = st[2], ry = st[3];
-    }
     *(uint64_t *)(s + 8) = b;
     static uint64_t last_b;
     if (b != last_b && getenv("LARECOMP_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
@@ -472,12 +418,12 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left)
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
 
-// FullKey for player 1 only (we report docked mode, where Handheld is unavailable)
+// FullKey / JoyDual / Handheld for Player 1 and Handheld
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
     static int nlog;
-    if (nlog++ < 4) LOG("[input] GetNpadStyleSet id %#x\n", id);
-    c->x[0] = id == 0 ? 1 : 0;  // docked: no handheld controller
+    if (nlog++ < 8) LOG("[input] GetNpadStyleSet id %#x\n", id);
+    c->x[0] = (id == 0 || id == 0x20) ? (1 | 2 | 4) : 0;
 }
 
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
