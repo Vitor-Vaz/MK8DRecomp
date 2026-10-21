@@ -3,11 +3,15 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../kernel.h"
 #include "../settings.h"
 
 static uint32_t new_event_handle(void) {
     uint32_t w, r;
-    kernel_create_event_pair(&w, &r);
+    KEvent *ev = kernel_create_event_pair(&w, &r);
+    pthread_mutex_lock(&g_klock);
+    kernel_signal(ev);
+    pthread_mutex_unlock(&g_klock);
     return r;
 }
 

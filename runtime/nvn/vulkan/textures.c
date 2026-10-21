@@ -391,29 +391,31 @@ static NvnTexture **g_live;
 static int g_nlive, g_cap_live;
 static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
 static void live_add(NvnTexture *t, TexBackend *b) {
-    pthread_mutex_lock(&live_lock);
     if (g_nlive == g_cap_live) { g_cap_live = g_cap_live ? g_cap_live * 2 : 1024; g_live = realloc(g_live, g_cap_live * sizeof *g_live); }
     g_live[g_nlive++] = t;
     b->reg = g_nlive;
-    pthread_mutex_unlock(&live_lock);
 }
 static void live_remove(TexBackend *b) {
-    pthread_mutex_lock(&live_lock);
-    if (!b->reg) { pthread_mutex_unlock(&live_lock); return; }
+    if (!b->reg) return;
+    if (b->reg > g_nlive) { b->reg = 0; return; }
     NvnTexture *last = g_live[--g_nlive];
     g_live[b->reg - 1] = last;
-    if (last->backend) ((TexBackend *)last->backend)->reg = b->reg;
+    if (last && last->backend) {
+        TexBackend *lb = (TexBackend *)last->backend;
+        lb->reg = b->reg;
+    }
     b->reg = 0;
-    pthread_mutex_unlock(&live_lock);
 }
 
 static TexBackend *tex_backend(NvnTexture *t) {
+    pthread_mutex_lock(&live_lock);
     TexBackend *b = t->backend;
     if (b) {
         if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
+        pthread_mutex_unlock(&live_lock);
         return b;
     }
     vk_collect_dead();
@@ -422,21 +424,24 @@ static TexBackend *tex_backend(NvnTexture *t) {
     create_image(t, b);
     t->backend = b;
     live_add(t, b);
+    pthread_mutex_unlock(&live_lock);
     return b;
 }
 
 void backend_texture_destroyed(NvnTexture *t) {
     if (!t) return;
+    pthread_mutex_lock(&live_lock);
     TexBackend *b = t->backend;
+    t->backend = NULL;
+    if (b) live_remove(b);
+    pthread_mutex_unlock(&live_lock);
     if (b) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);
         vk_alias_texture_destroyed(t);
-        live_remove(b);
         destroy_image(b);
         if (b->pending_rgba) vk_defer_free(b->pending_rgba);
         vk_defer_free(b);
     }
-    t->backend = NULL;
 }
 
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.

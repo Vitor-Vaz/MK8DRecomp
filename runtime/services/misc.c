@@ -48,12 +48,141 @@ SERVICE("aoc:u", aoc_u) {
 }
 
 // ------------------------------------------------------------------ mii:e / mii:u
+static void make_mii_char_info(uint8_t *ci, int idx, const char *name) {
+    memset(ci, 0, 0x58);
+    // create_id: 16 bytes UUID
+    ci[0] = 0x12; ci[1] = 0x34; ci[2] = 0x56; ci[3] = 0x78 + (uint8_t)idx;
+    ci[15] = (uint8_t)(idx + 1);
+    // Nickname UTF-16LE (up to 10 chars at +0x10)
+    for (int i = 0; name[i] && i < 10; i++) {
+        ((uint16_t *)(ci + 0x10))[i] = (uint16_t)name[i];
+    }
+    ci[0x26] = 0;   // font_region
+    ci[0x27] = (uint8_t)(idx % 12);  // favorite_color
+    ci[0x28] = (idx == 2) ? 1 : 0;   // gender (0=male, 1=female)
+    ci[0x29] = 64;  // height
+    ci[0x2A] = 64;  // build
+    ci[0x2B] = 0;   // type
+    ci[0x2C] = 0;   // region_move
+    ci[0x2D] = 0;   // faceline_type
+    ci[0x2E] = 0;   // faceline_color
+    ci[0x2F] = 0;   // faceline_wrinkle
+    ci[0x30] = 0;   // faceline_make
+    ci[0x31] = (uint8_t)(idx % 6);    // hair_type
+    ci[0x32] = 8;   // hair_color
+    ci[0x33] = 0;   // hair_flip
+    ci[0x34] = 0;   // eye_type
+    ci[0x35] = 8;   // eye_color
+    ci[0x36] = 4;   // eye_scale
+    ci[0x37] = 3;   // eye_aspect
+    ci[0x38] = 4;   // eye_rotate
+    ci[0x39] = 2;   // eye_x
+    ci[0x3A] = 12;  // eye_y
+    ci[0x3B] = 0;   // eyebrow_type
+    ci[0x3C] = 8;   // eyebrow_color
+    ci[0x3D] = 4;   // eyebrow_scale
+    ci[0x3E] = 3;   // eyebrow_aspect
+    ci[0x3F] = 4;   // eyebrow_rotate
+    ci[0x40] = 2;   // eyebrow_x
+    ci[0x41] = 10;  // eyebrow_y
+    ci[0x42] = 0;   // nose_type
+    ci[0x43] = 4;   // nose_scale
+    ci[0x44] = 9;   // nose_y
+    ci[0x45] = 0;   // mouth_type
+    ci[0x46] = 19;  // mouth_color
+    ci[0x47] = 4;   // mouth_scale
+    ci[0x48] = 3;   // mouth_aspect
+    ci[0x49] = 13;  // mouth_y
+    ci[0x4A] = (idx == 0 || idx == 1) ? 1 : 0; // mustache_type
+    ci[0x4B] = 0;   // beard_type
+    ci[0x4C] = 8;   // beard_color
+    ci[0x4D] = 4;   // mustache_scale
+    ci[0x4E] = 10;  // mustache_y
+    ci[0x4F] = 0;   // glass_type
+    ci[0x50] = 0;   // glass_color
+    ci[0x51] = 4;   // glass_scale
+    ci[0x52] = 10;  // glass_y
+    ci[0x53] = 0;   // mole_type
+    ci[0x54] = 4;   // mole_scale
+    ci[0x55] = 2;   // mole_x
+    ci[0x56] = 20;  // mole_y
+}
+
 static void mii_db_service(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
+    const char *names[] = { "Mario", "Luigi", "Peach", "Toad" };
     switch (req->cmd) {
-    case 0: case 1: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // IsUpdated, IsFullDatabase
-    case 2: case 3: case 4: case 5: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetCount, Get, Get1, UpdateLatest
-    default: LOG("[mii] IDatabaseService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x58); break;
+    case 0: case 1: // IsUpdated, IsFullDatabase
+        OUT(uint8_t, 0) = 0;
+        resp_size(resp, 1);
+        LOG("[mii] cmd %u (%s) -> 0\n", req->cmd, req->cmd == 0 ? "IsUpdated" : "IsFullDatabase");
+        break;
+    case 2: // GetCount
+        OUT(uint32_t, 0) = 4;
+        resp_size(resp, 4);
+        LOG("[mii] GetCount -> 4\n");
+        break;
+    case 3: { // Get(SourceFlag flag, out int count, OutArray<CharInfoElement> elements)
+        IpcBuf *b = out_buf(req, 0);
+        uint32_t count = 4;
+        if (b && b->addr && b->size >= 4 * 0x5C) {
+            for (uint32_t i = 0; i < 4; i++) {
+                uint8_t *elem = (uint8_t *)(uintptr_t)(b->addr + i * 0x5C);
+                make_mii_char_info(elem, i, names[i]);
+                *(uint32_t *)(elem + 0x58) = 0; // Source: 0 (Database)
+            }
+        } else if (b && b->addr && b->size >= 0x5C) {
+            count = b->size / 0x5C;
+            for (uint32_t i = 0; i < count; i++) {
+                uint8_t *elem = (uint8_t *)(uintptr_t)(b->addr + i * 0x5C);
+                make_mii_char_info(elem, i, names[i % 4]);
+                *(uint32_t *)(elem + 0x58) = 0;
+            }
+        }
+        OUT(uint32_t, 0) = count;
+        resp_size(resp, 4);
+        LOG("[mii] Get -> %u elements\n", count);
+        break;
+    }
+    case 4: { // Get1(SourceFlag flag, out int count, OutArray<CharInfo> elements)
+        IpcBuf *b = out_buf(req, 0);
+        uint32_t count = 4;
+        if (b && b->addr && b->size >= 4 * 0x58) {
+            for (uint32_t i = 0; i < 4; i++) {
+                uint8_t *ci = (uint8_t *)(uintptr_t)(b->addr + i * 0x58);
+                make_mii_char_info(ci, i, names[i]);
+            }
+        } else if (b && b->addr && b->size >= 0x58) {
+            count = b->size / 0x58;
+            for (uint32_t i = 0; i < count; i++) {
+                uint8_t *ci = (uint8_t *)(uintptr_t)(b->addr + i * 0x58);
+                make_mii_char_info(ci, i, names[i % 4]);
+            }
+        }
+        OUT(uint32_t, 0) = count;
+        resp_size(resp, 4);
+        LOG("[mii] Get1 -> %u elements\n", count);
+        break;
+    }
+    case 5: // UpdateLatest
+        OUT(uint32_t, 0) = 0;
+        resp_size(resp, 4);
+        LOG("[mii] UpdateLatest -> ok\n");
+        break;
+    case 6: // BuildRandom(gender, age, race) -> CharInfo (0x58 bytes)
+    case 7: { // BuildDefault(index) -> CharInfo (0x58 bytes)
+        int32_t idx = req->data_size >= 4 ? IN(int32_t, 0) : 0;
+        uint8_t *ci = resp->data;
+        const char *name = (idx >= 0 && idx < 4) ? names[idx] : "Player";
+        make_mii_char_info(ci, idx, name);
+        resp_size(resp, 0x58);
+        LOG("[mii] %s index %d -> created '%s'\n", req->cmd == 6 ? "BuildRandom" : "BuildDefault", idx, name);
+        break;
+    }
+    default:
+        LOG("[mii] IDatabaseService cmd %u (ok)\n", req->cmd);
+        resp_size(resp, 0x58);
+        break;
     }
 }
 

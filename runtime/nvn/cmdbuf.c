@@ -27,12 +27,20 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
     return r;
 }
 
-#define CMD_RING_SIZE (128ull << 20)
+#include <sys/mman.h>
+
+#define CMD_RING_SIZE (2048ull << 20)
 static uint8_t *g_cmd_ring;
 static uint64_t g_cmd_ring_pos;
 
 static uint64_t cmd_ring_alloc(uint64_t chunk_sz) {
-    if (!g_cmd_ring) g_cmd_ring = calloc(1, CMD_RING_SIZE);
+    if (!g_cmd_ring) {
+        g_cmd_ring = (uint8_t *)mmap(NULL, CMD_RING_SIZE, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (g_cmd_ring == MAP_FAILED) {
+            g_cmd_ring = calloc(1, CMD_RING_SIZE);
+        }
+    }
     uint64_t pos = __atomic_fetch_add(&g_cmd_ring_pos, chunk_sz, __ATOMIC_RELAXED);
     if ((pos % CMD_RING_SIZE) + chunk_sz > CMD_RING_SIZE) {
         pos = __atomic_fetch_add(&g_cmd_ring_pos, chunk_sz, __ATOMIC_RELAXED);

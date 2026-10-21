@@ -3115,6 +3115,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     copy_region_dims(t, dst, &fi, rg, &level, &row, &img);
     if (!fi || !fi->bpb) return;
     TexBackend *b = vk_tex(t, false);  // prior CPU contents uploaded first
+    if (!b || !b->image) return;
     renderer_mark_gpu_owned(t);
     if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
     if (b->astc_bw) {  // (blocks would need the CPU decode: not seen in the game yet)
@@ -3126,10 +3127,15 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
     uint32_t out_bpb = fi->bpb == 3 ? 4 : fi->bpb;
     uint32_t nz = (uint32_t)rg[5];
+    if (!wb || !hb || !nz || !rg[3] || !rg[4]) return;
     VkCommandBuffer cb = vk_cmd();
+    if (!cb) return;
     vk_full_barrier(cb);
     uint64_t out_row = (uint64_t)wb * out_bpb;
-    VkSpan s = vk_transient(out_row * hb * nz, 16);
+    uint64_t total_sz = out_row * hb * nz;
+    if (!total_sz) return;
+    VkSpan s = vk_transient(total_sz, 16);
+    if (!s.buf || !s.ptr) return;
     for (uint32_t z = 0; z < nz; z++)
         for (uint32_t y = 0; y < hb; y++) {
             const uint8_t *sr = (const uint8_t *)(uintptr_t)(src + (uint64_t)z * img + (uint64_t)y * row);
@@ -3142,6 +3148,13 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
+    if (!b->image || !cb || !s.buf || c.imageExtent.width == 0 || c.imageExtent.height == 0 || c.imageExtent.depth == 0) return;
+    LOG("[vk] copy_buffer_to_texture: cb=%p, buf=%p (off=%llu), img=%p, extent=%ux%ux%u, offset=%d,%d,%d, tex=%ux%ux%u, fmt=0x%x, lay=%u, mip=%u\n",
+        (void *)cb, (void *)s.buf, (unsigned long long)s.off, (void *)b->image,
+        c.imageExtent.width, c.imageExtent.height, c.imageExtent.depth,
+        c.imageOffset.x, c.imageOffset.y, c.imageOffset.z,
+        t->width, t->height, t->depth,
+        t->format, c.imageSubresource.baseArrayLayer, c.imageSubresource.mipLevel);
     vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
@@ -3618,6 +3631,7 @@ static void exec_list(uint64_t handle, int depth) {
     for (int guard = 0; guard < 10000000; guard++) {
         if (p < 0x10000) return;
         CmdRec *r = (CmdRec *)(uintptr_t)p;
+        if (r->size == 0 || r->size > 0x100000) return;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
@@ -3625,7 +3639,9 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;
-            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
+            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) {
+                if (h[i] >= 0x10000) exec_list(h[i], depth + 1);
+            }
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
