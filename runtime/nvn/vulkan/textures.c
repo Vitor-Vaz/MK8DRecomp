@@ -387,23 +387,20 @@ static void destroy_image(TexBackend *b) {
 }
 
 // Live game textures: an in-place reboot (vk_textures_reset) destroys them all.
-static NvnTexture **g_live;
+static TexBackend **g_live;
 static int g_nlive, g_cap_live;
 static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
-static void live_add(NvnTexture *t, TexBackend *b) {
+static void live_add(TexBackend *b) {
     if (g_nlive == g_cap_live) { g_cap_live = g_cap_live ? g_cap_live * 2 : 1024; g_live = realloc(g_live, g_cap_live * sizeof *g_live); }
-    g_live[g_nlive++] = t;
+    g_live[g_nlive++] = b;
     b->reg = g_nlive;
 }
 static void live_remove(TexBackend *b) {
     if (!b->reg) return;
     if (b->reg > g_nlive) { b->reg = 0; return; }
-    NvnTexture *last = g_live[--g_nlive];
+    TexBackend *last = g_live[--g_nlive];
     g_live[b->reg - 1] = last;
-    if (last && last->backend) {
-        TexBackend *lb = (TexBackend *)last->backend;
-        lb->reg = b->reg;
-    }
+    if (last) last->reg = b->reg;
     b->reg = 0;
 }
 
@@ -423,7 +420,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
-    live_add(t, b);
+    live_add(b);
     pthread_mutex_unlock(&live_lock);
     return b;
 }
@@ -449,7 +446,16 @@ void vk_textures_reset(void) {
     int n = g_nlive;
     extern void vk_alias_reset(void);
     vk_alias_reset();
-    while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
+    pthread_mutex_lock(&live_lock);
+    while (g_nlive > 0) {
+        TexBackend *b = g_live[--g_nlive];
+        if (!b) continue;
+        b->reg = 0;
+        destroy_image(b);
+        if (b->pending_rgba) vk_defer_free(b->pending_rgba);
+        vk_defer_free(b);
+    }
+    pthread_mutex_unlock(&live_lock);
     vk_collect_dead();
     LOG("[vk] reboot: %d textures released\n", n);
 }
