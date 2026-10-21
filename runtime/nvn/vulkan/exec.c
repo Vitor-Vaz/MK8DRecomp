@@ -3148,14 +3148,9 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    if (!b->image || !cb || !s.buf || c.imageExtent.width == 0 || c.imageExtent.height == 0 || c.imageExtent.depth == 0) return;
-    LOG("[vk] copy_buffer_to_texture: cb=%p, buf=%p (off=%llu), img=%p, extent=%ux%ux%u, offset=%d,%d,%d, tex=%ux%ux%u, fmt=0x%x, lay=%u, mip=%u\n",
-        (void *)cb, (void *)s.buf, (unsigned long long)s.off, (void *)b->image,
-        c.imageExtent.width, c.imageExtent.height, c.imageExtent.depth,
-        c.imageOffset.x, c.imageOffset.y, c.imageOffset.z,
-        t->width, t->height, t->depth,
-        t->format, c.imageSubresource.baseArrayLayer, c.imageSubresource.mipLevel);
-    vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    const VkImage dst_image = b->image;
+    if (!dst_image || !cb || !s.buf || c.imageExtent.width == 0 || c.imageExtent.height == 0 || c.imageExtent.depth == 0) return;
+    vkCmdCopyBufferToImage(cb, s.buf, dst_image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
