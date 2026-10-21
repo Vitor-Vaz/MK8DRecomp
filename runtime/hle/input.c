@@ -48,10 +48,6 @@ static void recompute_keyboard(void) {
     if (held_key(SDL_SCANCODE_SPACE) || held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER) ||
         held_key(SDL_SCANCODE_C) || held_key(SDL_SCANCODE_K)) {
         b |= (1ull << BTN_A);
-        // On title / controller registration screen, pressing Space or Enter also satisfies "Press L + R"
-        if (held_key(SDL_SCANCODE_SPACE) || held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER)) {
-            b |= (1ull << BTN_L) | (1ull << BTN_R);
-        }
     }
     // B (Brake / Reverse / Cancel): X, Z, Backspace, Escape, or J
     if (held_key(SDL_SCANCODE_X) || held_key(SDL_SCANCODE_Z) || held_key(SDL_SCANCODE_BACKSPACE) ||
@@ -66,8 +62,8 @@ static void recompute_keyboard(void) {
     if (held_key(SDL_SCANCODE_LCTRL) || held_key(SDL_SCANCODE_RCTRL) || held_key(SDL_SCANCODE_Q) || held_key(SDL_SCANCODE_1)) {
         b |= (1ull << BTN_L) | (1ull << BTN_ZL);
     }
-    // Plus (Pause / Menu): Enter, P, or Escape
-    if (held_key(SDL_SCANCODE_RETURN) || held_key(SDL_SCANCODE_KP_ENTER) || held_key(SDL_SCANCODE_P)) {
+    // Plus (Pause / Menu): P or F1
+    if (held_key(SDL_SCANCODE_P) || held_key(SDL_SCANCODE_F1)) {
         b |= (1ull << BTN_PLUS);
     }
     // Minus (Map): Tab, M
@@ -207,6 +203,9 @@ void input_handle_event(const SDL_Event *e) {
     }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
+        LOG("[input] key %s: scancode=%d name=%s\n",
+            e->type == SDL_EVENT_KEY_DOWN ? "DOWN" : "UP",
+            e->key.scancode, SDL_GetScancodeName(e->key.scancode));
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
@@ -383,6 +382,7 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+
     const char *spec = getenv("LARECOMP_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
@@ -439,8 +439,8 @@ static void fill_state(Cpu *c) {
     memset(s, 0, 0x28);
     *(int64_t *)s = ++sampling;
     static int nlog;
-    if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, c->x[30]); }
-    if (id != 0 && id != 0x20) return;  // Player 1 (FullKey / JoyDual) or Handheld
+    if (nlog < 20) { nlog++; LOG("[npad] GetNpadState id=%u (%#x) lr=%llx\n", id, id, (unsigned long long)c->x[30]); }
+    if (id != 0) return;  // only player 1 (a FullKey pad) is connected
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
     uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
@@ -501,13 +501,98 @@ HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", hid_states_le
 HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", hid_states_handheld) { fill_states(c); }
 HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", hid_states_right) { fill_states(c); }
 
-// FullKey / JoyDual / Handheld for Player 1 and Handheld
+static void hook_title_state_machine(Cpu *c) {
+    uint32_t state = *(uint32_t *)(uintptr_t)(c->x[0] + 0x124);
+    static uint32_t last_state = 999;
+    if (state != last_state) {
+        LOG("[title] Title state machine: state=%u (this=%p)\n", state, (void *)c->x[0]);
+        last_state = state;
+    }
+    if (state == 2) {
+        // Auto-select Mii: set bit 4 (0x10) in player manager flag at +0x7c
+        Cpu tmp = *c;
+        GuestFn fn_mgr = dispatch_lookup(0x70008b9438ull);
+        if (fn_mgr) {
+            fn_mgr(&tmp);
+            if (tmp.x[0]) {
+                uint64_t p = *(uint64_t *)(uintptr_t)(tmp.x[0] + 0x488);
+                if (p) {
+                    uint8_t *flag = (uint8_t *)(uintptr_t)(p + 0x7c);
+                    LOG("[title] state=2: auto-assigning default Mii (flag was 0x%02x, setting bit 4)\n", *flag);
+                    *flag |= 0x10;
+                }
+            }
+        }
+    }
+    GuestFn fn = dispatch_lookup(0x70004d3c20ull);
+    if (fn) fn(c);
+}
+
+static void install_input_hooks(void) {
+    static bool installed;
+    if (installed) return;
+    installed = true;
+    hle_override(0x70004d3c20ull, hook_title_state_machine, "TitleStateMachine");
+}
+
+RT_ON_RESET(input_hooks_init) {
+    install_input_hooks();
+}
+
+// Npad policy (no pokes into the game's controller objects): only player 1 (id 0) exists, as a FullKey pad, and only
+// once the game has called InitializeNpad. Handheld (0x20) and every other id report no style, so the game never
+// pairs a second, unassigned controller.
+static _Atomic int npad_initialized = 1;
+static _Atomic uint32_t npad_supported_styles = 1;
+static _Atomic uint32_t npad_ids = 1;  // bit i = npad id i (id 0x20 -> bit 8)
+static _Atomic int npad_disconnected;
+RT_ON_RESET(npad_policy_reset) { npad_initialized = 1; npad_supported_styles = 1; npad_ids = 1; npad_disconnected = 0; }
+
+static uint32_t npad_style(uint32_t id) {
+    if (!npad_initialized || npad_disconnected || id != 0) return 0;
+    if (!(npad_ids & 1u) || !(npad_supported_styles & 1u)) return 0;
+    return 1;  // NpadStyleTag::FullKey
+}
+
+// The SDK's own InitializeNpad / SetSupported* / touch initialisers keep running (they open the hid service and its
+// shared memory, which other SDK paths rely on); only the style query and state reads are ours.
+
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
+    install_input_hooks();
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
     static int nlog;
-    if (nlog++ < 8) LOG("[input] GetNpadStyleSet id %#x\n", id);
-    c->x[0] = (id == 0 || id == 0x20) ? (1 | 2 | 4) : 0;
+    uint32_t st = npad_style(id);
+    if (nlog++ < 8) LOG("[input] GetNpadStyleSet id %#x -> %u\n", id, st);
+    c->x[0] = st;
 }
+
+// Missing HLE stubs for MK8D controller management and assignment:
+HLE_FUNC("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", hid_show_controller_support) {
+    uint8_t *info = (uint8_t *)(uintptr_t)c->x[0];
+    if (info) {
+        memset(info, 0, 8);
+        info[0] = 1;                 // 1 player
+        *(uint32_t *)(info + 4) = 0; // selected NpadId = 0
+    }
+    c->x[0] = 0; // Success
+    LOG("[input] ShowControllerSupport -> player 1 assigned\n");
+}
+
+HLE_FUNC("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", hid_show_controller_support_noinfo) {
+    c->x[0] = 0;
+    LOG("[input] ShowControllerSupport (noinfo) -> ok\n");
+}
+
+HLE_FUNC("_ZN2nn3hid14DisconnectNpadERKj", hid_disconnect_npad) {
+    if (*(uint32_t *)(uintptr_t)c->x[0] == 0) npad_disconnected = 1;
+    c->x[0] = 0;
+}
+HLE_FUNC("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKj", hid_set_joy_single) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", hid_set_joy_single_dev) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", hid_set_joy_dual) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", hid_merge_single_joy) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid18SwapNpadAssignmentERKjS2_", hid_swap_npad) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid20GetNpadJoyAssignmentERKj", hid_get_joy_assignment) { c->x[0] = 0; }
 
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
 // controller connected.
