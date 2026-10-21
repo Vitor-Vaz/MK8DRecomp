@@ -33,6 +33,9 @@ typedef struct NvnTexture {
     void *backend;  // renderer-side texture
     uint64_t debug_id;
     char label[64];
+    int reg_pool[4];
+    int reg_id[4];
+    int n_reg;
 } NvnTexture;
 
 typedef struct {

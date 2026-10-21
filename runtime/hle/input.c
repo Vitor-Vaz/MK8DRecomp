@@ -486,7 +486,11 @@ static void fill_states(Cpu *c) {
     tmp.x[0] = (uint64_t)(uintptr_t)s;
     tmp.x[1] = (uint64_t)(uintptr_t)c->x[2];
     fill_state(&tmp);
-    c->x[0] = 1;
+    for (int i = 1; i < count && i < 16; i++) {
+        memcpy(s + i * 0x28, s, 0x28);
+        *(int64_t *)(s + i * 0x28) = *(int64_t *)s - i;
+    }
+    c->x[0] = count > 16 ? 16 : count;
 }
 
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }

@@ -405,22 +405,46 @@ extern NvnDescPool *g_texture_pools[64];
 
 extern void vk_defer_free(void *ptr);
 
-NVN(nvnTextureFinalize) {
-    NvnTexture *t = HOST(NvnTexture, A(0));
-    if (t) {
-        for (int p = 0; p < 64; p++) {
-            NvnDescPool *dp = g_texture_pools[p];
-            if (!dp || !dp->entries) continue;
-            NvnTexEntry *entries = (NvnTexEntry *)dp->entries;
-            for (int i = 0; i < dp->count; i++) {
-                if (entries[i].tex == t) {
-                    entries[i].tex = NULL;
-                    entries[i].has_view = false;
+static NvnTexture *g_pending_finalize[1024];
+static int g_npending_finalize;
+static pthread_mutex_t finalize_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void nvn_flush_pending_finalizes(void) {
+    pthread_mutex_lock(&finalize_lock);
+    for (int i = 0; i < g_npending_finalize; i++) {
+        NvnTexture *t = g_pending_finalize[i];
+        if (!t) continue;
+        for (int k = 0; k < t->n_reg; k++) {
+            int p = t->reg_pool[k];
+            if (p >= 0 && p < 64) {
+                NvnDescPool *dp = g_texture_pools[p];
+                if (dp && dp->entries && t->reg_id[k] >= 0 && t->reg_id[k] < dp->count) {
+                    NvnTexEntry *entries = (NvnTexEntry *)dp->entries;
+                    if (entries[t->reg_id[k]].tex == t) {
+                        entries[t->reg_id[k]].tex = NULL;
+                        entries[t->reg_id[k]].has_view = false;
+                    }
                 }
             }
         }
         backend_texture_destroyed(t);
         vk_defer_free(t);
+    }
+    g_npending_finalize = 0;
+    pthread_mutex_unlock(&finalize_lock);
+}
+
+NVN(nvnTextureFinalize) {
+    NvnTexture *t = HOST(NvnTexture, A(0));
+    if (t) {
+        pthread_mutex_lock(&finalize_lock);
+        if (g_npending_finalize < 1024) {
+            g_pending_finalize[g_npending_finalize++] = t;
+        } else {
+            backend_texture_destroyed(t);
+            vk_defer_free(t);
+        }
+        pthread_mutex_unlock(&finalize_lock);
     }
     SET_HOST(A(0), 0);
 }
@@ -585,7 +609,11 @@ NVN(nvnSamplerGetDebugID) { RET(A(0)); }
 
 // ================================================================== descriptor pools
 NvnDescPool *g_texture_pools[64], *g_sampler_pools[64];
-RT_ON_RESET(desc_pools_reset) { memset(g_texture_pools, 0, sizeof g_texture_pools); memset(g_sampler_pools, 0, sizeof g_sampler_pools); }
+RT_ON_RESET(desc_pools_reset) {
+    nvn_flush_pending_finalizes();
+    memset(g_texture_pools, 0, sizeof g_texture_pools);
+    memset(g_sampler_pools, 0, sizeof g_sampler_pools);
+}
 
 static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, int count, size_t entry, NvnDescPool **reg) {
     NvnDescPool *d = calloc(1, sizeof *d);
@@ -622,11 +650,22 @@ NVN(nvnTexturePoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id < 0 || id >= d->count) return;
+    if (!d || !d->entries || id < 0 || id >= d->count) return;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
-    e->tex = HOST(NvnTexture, A(2));
+    NvnTexture *new_tex = HOST(NvnTexture, A(2));
+    e->tex = new_tex;
+    if (new_tex && new_tex->n_reg < 4) {
+        int p_idx = -1;
+        for (int i = 0; i < 64; i++) {
+            if (g_texture_pools[i] == d) { p_idx = i; break; }
+        }
+        new_tex->reg_pool[new_tex->n_reg] = p_idx;
+        new_tex->reg_id[new_tex->n_reg] = id;
+        new_tex->n_reg++;
+    }
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    else memset(&e->view, 0, sizeof e->view);
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
