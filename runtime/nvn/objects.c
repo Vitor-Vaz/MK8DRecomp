@@ -405,46 +405,28 @@ extern NvnDescPool *g_texture_pools[64];
 
 extern void vk_defer_free(void *ptr);
 
-static NvnTexture *g_pending_finalize[1024];
-static int g_npending_finalize;
-static pthread_mutex_t finalize_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t tex_lifetime_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void nvn_flush_pending_finalizes(void) {
-    pthread_mutex_lock(&finalize_lock);
-    for (int i = 0; i < g_npending_finalize; i++) {
-        NvnTexture *t = g_pending_finalize[i];
-        if (!t) continue;
-        for (int k = 0; k < t->n_reg; k++) {
-            int p = t->reg_pool[k];
-            if (p >= 0 && p < 64) {
-                NvnDescPool *dp = g_texture_pools[p];
-                if (dp && dp->entries && t->reg_id[k] >= 0 && t->reg_id[k] < dp->count) {
-                    NvnTexEntry *entries = (NvnTexEntry *)dp->entries;
-                    if (entries[t->reg_id[k]].tex == t) {
-                        entries[t->reg_id[k]].tex = NULL;
-                        entries[t->reg_id[k]].has_view = false;
-                    }
-                }
-            }
-        }
+static void release_texture_locked(NvnTexture *t) {
+    if (!t) return;
+    if (t->finalized && t->reg_count <= 0) {
         backend_texture_destroyed(t);
         vk_defer_free(t);
     }
-    g_npending_finalize = 0;
-    pthread_mutex_unlock(&finalize_lock);
+}
+
+void nvn_flush_pending_finalizes(void) {
+    // Descriptor-entry-driven lifetime: textures remain valid as long as they are
+    // referenced in a descriptor pool entry, allowing multi-frame and cross-pass reuse.
 }
 
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     if (t) {
-        pthread_mutex_lock(&finalize_lock);
-        if (g_npending_finalize < 1024) {
-            g_pending_finalize[g_npending_finalize++] = t;
-        } else {
-            backend_texture_destroyed(t);
-            vk_defer_free(t);
-        }
-        pthread_mutex_unlock(&finalize_lock);
+        pthread_mutex_lock(&tex_lifetime_lock);
+        t->finalized = true;
+        release_texture_locked(t);
+        pthread_mutex_unlock(&tex_lifetime_lock);
     }
     SET_HOST(A(0), 0);
 }
@@ -635,9 +617,21 @@ NVN(nvnTexturePoolInitialize) {
 NVN(nvnTexturePoolFinalize) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     if (d) {
+        pthread_mutex_lock(&tex_lifetime_lock);
         for (int i = 0; i < 64; i++) {
             if (g_texture_pools[i] == d) g_texture_pools[i] = NULL;
         }
+        if (d->entries) {
+            NvnTexEntry *entries = (NvnTexEntry *)d->entries;
+            for (int i = 0; i < d->count; i++) {
+                NvnTexture *t = entries[i].tex;
+                if (t) {
+                    t->reg_count--;
+                    release_texture_locked(t);
+                }
+            }
+        }
+        pthread_mutex_unlock(&tex_lifetime_lock);
         free(d->entries);
         free(d);
         SET_HOST(A(0), 0);
@@ -653,16 +647,17 @@ static void register_texture(Cpu *c) {
     if (!d || !d->entries || id < 0 || id >= d->count) return;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
     NvnTexture *new_tex = HOST(NvnTexture, A(2));
-    e->tex = new_tex;
-    if (new_tex && new_tex->n_reg < 4) {
-        int p_idx = -1;
-        for (int i = 0; i < 64; i++) {
-            if (g_texture_pools[i] == d) { p_idx = i; break; }
+    pthread_mutex_lock(&tex_lifetime_lock);
+    NvnTexture *old_tex = e->tex;
+    if (old_tex != new_tex) {
+        if (old_tex) {
+            old_tex->reg_count--;
+            release_texture_locked(old_tex);
         }
-        new_tex->reg_pool[new_tex->n_reg] = p_idx;
-        new_tex->reg_id[new_tex->n_reg] = id;
-        new_tex->n_reg++;
+        e->tex = new_tex;
+        if (new_tex) new_tex->reg_count++;
     }
+    pthread_mutex_unlock(&tex_lifetime_lock);
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
     else memset(&e->view, 0, sizeof e->view);

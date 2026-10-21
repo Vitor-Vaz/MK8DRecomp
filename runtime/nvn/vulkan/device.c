@@ -489,6 +489,7 @@ void backend_represent(void) {
 
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
+    renderer_submit();  // same queue: the present pass runs after the frame's work
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();

@@ -415,8 +415,26 @@ static TexBackend *tex_backend(NvnTexture *t) {
         pthread_mutex_unlock(&live_lock);
         return b;
     }
+    if (t->addr) {
+        for (int i = 0; i < g_nlive; i++) {
+            TexBackend *cand = g_live[i];
+            if (cand && cand->addr == t->addr && cand->nvn_format == t->format &&
+                cand->width == t->width && cand->height == t->height &&
+                cand->depth == t->depth && cand->levels == t->levels &&
+                cand->layers == t->layout.layers && cand->target == t->target) {
+                cand->ref_cnt++;
+                t->backend = cand;
+                pthread_mutex_unlock(&live_lock);
+                return cand;
+            }
+        }
+    }
     vk_collect_dead();
     b = calloc(1, sizeof *b);
+    b->addr = t->addr;
+    b->nvn_format = t->format;
+    b->target = t->target;
+    b->ref_cnt = 1;
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
@@ -430,7 +448,14 @@ void backend_texture_destroyed(NvnTexture *t) {
     pthread_mutex_lock(&live_lock);
     TexBackend *b = t->backend;
     t->backend = NULL;
-    if (b) live_remove(b);
+    if (b) {
+        b->ref_cnt--;
+        if (b->ref_cnt <= 0) {
+            live_remove(b);
+        } else {
+            b = NULL;
+        }
+    }
     pthread_mutex_unlock(&live_lock);
     if (b) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);
