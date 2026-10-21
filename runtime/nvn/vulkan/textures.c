@@ -600,11 +600,6 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint64_t layer_size = tegra_layer_size(&t->layout);
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
     bool linear = (t->flags & 0x10) != 0;
-    // An unpackaged single-level 2D texture without a stride and not a shader-image (NVN flag 0x4) is CPU-written
-    // linear rows (MK8D specular-power table and ambient cube input tables). Untiled as block-linear they were scrambled.
-    if (!linear && !t->stride && !t->layout.block_height_log2 && !(t->flags & 0x4) && levels == 1 && layers == 1 && !b->astc_bw) {
-        linear = true;
-    }
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
