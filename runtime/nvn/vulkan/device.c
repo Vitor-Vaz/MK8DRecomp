@@ -265,7 +265,17 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    LOG("[vk] available present modes (%u):", n);
+    for (uint32_t i = 0; i < n; i++) LOG(" %s", m[i] == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : m[i] == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : m[i] == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : "other");
+    LOG("\n");
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) { LOG("[vk] using present mode: %s\n", want == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "immediate"); return want; }
+    if (want == VK_PRESENT_MODE_MAILBOX_KHR) {
+        for (uint32_t i = 0; i < n; i++) if (m[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            LOG("[vk] mailbox not available, using immediate\n");
+            return VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+    }
+    LOG("[vk] using fallback present mode: fifo\n");
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -288,6 +298,7 @@ static void create_swapchain(void) {
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
+    LOG("[vk] swapchain image count: %u (min=%u max=%u)\n", count, caps.minImageCount, caps.maxImageCount);
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
@@ -478,17 +489,13 @@ void backend_represent(void) {
 
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
+    renderer_submit();  // same queue: the present pass runs after the frame's work
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     bool have = vk_frame_begin(black);
-    uint64_t nd = SDL_GetTicksNS() - t0;
-    if (nd > 30000000) {
-        static int warned;
-        if (warned++ < 20) LOG("[vk] acquire blocked %llums\n", (unsigned long long)(nd / 1000000));
-    }
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
         extern void widescreen_frame_end(uint64_t frame);
@@ -518,9 +525,13 @@ void backend_present(NvnTexture *t) {
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
         vk_frame_end(shot ? "build/window.png" : NULL);
+        extern void nvn_flush_pending_finalizes(void);
+        nvn_flush_pending_finalizes();
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
+        extern void nvn_flush_pending_finalizes(void);
+        nvn_flush_pending_finalizes();
     }
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);

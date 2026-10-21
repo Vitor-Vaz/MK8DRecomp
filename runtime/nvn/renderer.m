@@ -1656,6 +1656,8 @@ static void draw(CmdRec *r, bool indexed) {
                 }
             }
             for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+            // MK8D Main Menu: skip unblended backing quad that occludes bottom 3D scene ("pano preto")
+            if (last_hash == 0x4ae943a287b1f81eull) { stat_skipped++; return; }
             extern bool pot_level_active(void);
             if (last_hash == 0xa2177dbb72197bd9ull && pot_level_active()) { stat_skipped++; return; }  // item twinkle
         }

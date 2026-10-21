@@ -415,8 +415,26 @@ static TexBackend *tex_backend(NvnTexture *t) {
         pthread_mutex_unlock(&live_lock);
         return b;
     }
+    if (t->addr) {
+        for (int i = 0; i < g_nlive; i++) {
+            TexBackend *cand = g_live[i];
+            if (cand && cand->addr == t->addr && cand->nvn_format == t->format &&
+                cand->width == t->width && cand->height == t->height &&
+                cand->depth == t->depth && cand->levels == t->levels &&
+                cand->layers == t->layout.layers && cand->target == t->target) {
+                cand->ref_cnt++;
+                t->backend = cand;
+                pthread_mutex_unlock(&live_lock);
+                return cand;
+            }
+        }
+    }
     vk_collect_dead();
     b = calloc(1, sizeof *b);
+    b->addr = t->addr;
+    b->nvn_format = t->format;
+    b->target = t->target;
+    b->ref_cnt = 1;
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
@@ -430,7 +448,14 @@ void backend_texture_destroyed(NvnTexture *t) {
     pthread_mutex_lock(&live_lock);
     TexBackend *b = t->backend;
     t->backend = NULL;
-    if (b) live_remove(b);
+    if (b) {
+        b->ref_cnt--;
+        if (b->ref_cnt <= 0) {
+            live_remove(b);
+        } else {
+            b = NULL;
+        }
+    }
     pthread_mutex_unlock(&live_lock);
     if (b) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);
@@ -528,12 +553,11 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!total) return;
     b->checked_frame = frame;
     prof_tex_checks++;
-    if (t->flags & 0x10) b->dynamic = true;
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("LARECOMP_TEX_FULLHASH") ? 1 : 0;
-    bool full = b->dynamic || !b->uploaded || always_full;
+    bool full = !b->uploaded || always_full;
     bool periodic = frame - b->full_frame >= 120 && full_hash_budget >= total;  // (safety net: a full hash now and then)
     if (!full && periodic) { full = true; full_hash_budget -= total; }
     if (!b->tp) b->tp = texpatch_identify(t) + 1;  // (button prompts / Hero Mode icon: re-uploaded when their look changes)
@@ -574,8 +598,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint64_t layer_size = tegra_layer_size(&t->layout);
-    bool linear = (t->flags & 0x10) != 0;
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    bool linear = (t->flags & 0x10) != 0;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
@@ -610,7 +634,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
-                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * t->stride, row);
+                uint32_t stride = t->stride ? (uint32_t)t->stride : row;
+                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * stride, row);
             } else {
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }

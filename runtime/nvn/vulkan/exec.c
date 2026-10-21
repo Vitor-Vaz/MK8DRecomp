@@ -142,7 +142,7 @@ static uint64_t stat_pace_over;
 
 void vk_pace_frame(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LARECOMP_PACE"); on = !e || atoi(e) != 0; }
+    if (on < 0) { const char *e = getenv("LARECOMP_PACE"); on = e ? atoi(e) != 0 : 0; }
     static uint64_t last, last_wait;
     static uint8_t over[60];
     static int idx, nover, calm;
@@ -873,10 +873,12 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
+    if (g_debug_frame) LOG("[pass] end_pass at line %d\n", line);
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
-    if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
+    vk_full_barrier(vk_cmd());
+    if (g_debug_frame && getenv("LARECOMP_DUMP_PASSES") && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
         static int multi = -1;
@@ -929,6 +931,7 @@ static void begin_pass(void) {
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
         }
+        if (g_debug_frame) LOG("[pass] begin rt%d %p loadOp=%s\n", i, (void *)t, ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? "CLEAR" : "LOAD");
         pass_color[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) && vk_format(t->format) == b->format
                       ? vk_format(st.rt.cview[i].format) : b->format;
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
@@ -1122,6 +1125,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
+    if (g_debug_frame) LOG("[clear] rt %p index %d rect %d %d %d %d\n", (void *)st.rt.color[0], index, rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
@@ -1567,8 +1571,13 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
-    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) {
+        if (g_debug_frame) LOG("[tex_obj_NOH] stage=%d slot=%d off=%d h=%llx tpool=%p count=%d\n",
+                               stage, slot, (int)st_->handle_offset, (unsigned long long)h, (void *)st.tpool, st.tpool ? st.tpool->count : 0);
+        return NULL;
+    }
+    NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    return t;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -2644,6 +2653,8 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+        // MK8D Main Menu: skip unblended backing quad that occludes bottom 3D scene ("pano preto")
+        if (last_hash == 0x4ae943a287b1f81eull) { stat_skipped++; return; }
         extern bool pot_level_active(void);
         if (last_hash == 0xa2177dbb72197bd9ull && pot_level_active()) { stat_skipped++; return; }
         if (g_debug_frame && getenv("LARECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
@@ -3056,7 +3067,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %p:%ux%u/f%#x", (void *)st.rt.color[i], st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
@@ -3070,19 +3081,40 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG("\n");
         }
         for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
-            const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
-            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+            if (!((pr->vi->cbuf_mask >> c) & 1)) continue;
+            int idx = c - 3;
+            if (idx < 0 || idx >= 18 || !st.ubuf[0][idx].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][idx].addr;
+            LOG("[draw]   vcb%d(ubuf%d) %llx size %u:", c, idx, (unsigned long long)st.ubuf[0][idx].addr, (unsigned)st.ubuf[0][idx].size);
+            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[0][idx].size; k++) LOG(" %.6g", u[k]);
+            LOG("\n");
+        }
+        for (int c = 0; c < 18; c++) {
+            if (!((pr->fi->cbuf_mask >> c) & 1)) continue;
+            int idx = c - 3;
+            if (idx < 0 || idx >= 18 || !st.ubuf[1][idx].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[1][idx].addr;
+            LOG("[draw]   fcb%d(ubuf%d) %llx size %u:", c, idx, (unsigned long long)st.ubuf[1][idx].addr, (unsigned)st.ubuf[1][idx].size);
+            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][idx].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {  // fragment textures: guest size / format, allocation, scale
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
-        if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
+        if (!t) {
+            int slot = ((int)pr->fi->tex[i].handle_offset - 0x20) / 8;
+            uint64_t h = (slot >= 0 && slot < 32) ? st.tex[1][slot] : 0;
+            LOG("[draw]   tex%d: none (off=%u slot=%d h=%llx)\n", i, pr->fi->tex[i].handle_offset, slot, (unsigned long long)h);
+            continue;
+        }
         LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s\n", i, (void *)t, t->width, t->height, t->format,
             b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0, b && b->scalable ? " scalable" : "");
+    }
+    if (g_debug_frame) {
+        LOG("[draw]   bound st.tex[1]:");
+        for (int k = 0; k < 16; k++) if (st.tex[1][k]) LOG(" [%d]=%llx", k, (unsigned long long)st.tex[1][k]);
+        LOG("\n");
     }
 }
 
@@ -3549,6 +3581,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    vk_full_barrier(cb);
     VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
